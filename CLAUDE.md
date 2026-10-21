@@ -54,7 +54,7 @@ Reliability first: losing a recording of an important call is the main failure m
 - Never set `target.object` or `node.dont-reconnect` on capture streams (spec 5.2).
 - `mixer` and `writer` must not depend on `pipewire`. Keep them pure enough to unit-test
   without audio hardware. Required tests are listed in spec section 7.
-- Thresholds and timings (1600, 4800 samples, 100 ms, 2 s, −60 dB / 60 s, 1 GB) are named
+- Thresholds and timings (1600, 3200, 4800, 320 samples, 100 ms, 2 s, −60 dB / 60 s, 1 GB) are named
   constants, not literals.
 - Errors: typed errors (`thiserror`-style enums or small structs) at module boundaries
   where callers branch on the cause; `anyhow` with `.context(...)` at the top level and

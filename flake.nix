@@ -36,6 +36,8 @@
             flac
             # Manual acceptance checks: ffprobe / ffplay, pw-record / pw-dump / pw-link
             ffmpeg
+            # JSON parsing in Claude Code hooks (.claude/hooks)
+            jq
             pipewire
             wireplumber
           ];

@@ -8,6 +8,8 @@ mod mixer;
 #[allow(dead_code)]
 mod pw;
 #[allow(dead_code)]
+mod ui;
+#[allow(dead_code)]
 mod writer;
 
 use std::thread;

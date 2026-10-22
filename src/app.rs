@@ -237,13 +237,7 @@ impl<S: Storage> App<S> {
     /// Whether a command does anything in the current state (spec 3).
     #[must_use]
     pub fn allows(&self, command: Command) -> bool {
-        match command {
-            Command::Start => self.state == State::Idle,
-            Command::TogglePause | Command::Stop => {
-                matches!(self.state, State::Recording | State::Paused)
-            }
-            Command::Quit => true,
-        }
+        allows(self.state, command)
     }
 
     /// Handles a command. `Stop` and `Quit` while recording leave the app in
@@ -460,6 +454,17 @@ impl<S: Storage> App<S> {
             them: self.them.view(recording),
             log: self.log.iter().cloned().collect(),
         }
+    }
+}
+
+/// Whether a command does anything in `state` (spec 3). The UI dims the
+/// buttons for which this is false.
+#[must_use]
+pub fn allows(state: State, command: Command) -> bool {
+    match command {
+        Command::Start => state == State::Idle,
+        Command::TogglePause | Command::Stop => matches!(state, State::Recording | State::Paused),
+        Command::Quit => true,
     }
 }
 

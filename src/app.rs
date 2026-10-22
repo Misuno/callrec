@@ -119,11 +119,6 @@ impl DiskStorage {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
-
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
 }
 
 impl Storage for DiskStorage {

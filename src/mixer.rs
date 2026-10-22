@@ -92,7 +92,7 @@ impl Mixer {
     }
 
     /// Number of samples currently queued for a channel.
-    #[must_use]
+    #[cfg(test)]
     pub fn queued(&self, channel: Channel) -> usize {
         match channel {
             Channel::Mic => self.mic.samples.len(),

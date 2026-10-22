@@ -453,6 +453,77 @@ fn buttons_line(state: State) -> (Line<'static>, Vec<(u16, u16, Button)>) {
     (Line::from(spans), areas)
 }
 
+/// Answer to the start-up question about unfinished recordings (spec 6.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryChoice {
+    /// `y`: decode through errors and encode again.
+    Recover,
+    /// `d`: delete them.
+    Delete,
+    /// `l`: leave them for later.
+    Later,
+    /// Ctrl+C or `q`: exit without touching them.
+    Quit,
+}
+
+#[must_use]
+pub fn recovery_choice(key: KeyEvent) -> Option<RecoveryChoice> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Some(RecoveryChoice::Quit);
+    }
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+    match c.to_lowercase().next().unwrap_or(c) {
+        'y' | 'н' => Some(RecoveryChoice::Recover),
+        'd' | 'в' => Some(RecoveryChoice::Delete),
+        'l' | 'д' => Some(RecoveryChoice::Later),
+        'q' | 'й' => Some(RecoveryChoice::Quit),
+        _ => None,
+    }
+}
+
+/// The start-up dialog listing unfinished recordings. With `progress`, the
+/// keys are hidden and the progress text is shown instead.
+pub fn draw_recovery(frame: &mut Frame<'_>, files: &[std::path::PathBuf], progress: Option<&str>) {
+    let block = Block::bordered()
+        .title(" callrec: незавершённые записи ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(frame.area());
+    frame.render_widget(block, frame.area());
+
+    let mut lines = vec![
+        Line::default(),
+        Line::from("  Найдены записи, прерванные аварийным завершением:"),
+        Line::default(),
+    ];
+    for file in files {
+        lines.push(Line::from(format!("    {}", app::display_path(file))));
+    }
+    lines.push(Line::default());
+    match progress {
+        Some(text) => lines.push(Line::styled(
+            format!("  {text}"),
+            Style::default().fg(Color::Cyan),
+        )),
+        None => lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "[y] Восстановить",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("[d] Удалить", Style::default().fg(Color::Red)),
+            Span::raw("   "),
+            Span::raw("[l] Оставить на потом"),
+        ])),
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 /// `HH:MM:SS`.
 fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
@@ -724,6 +795,33 @@ mod tests {
         assert_eq!(
             format_duration(Duration::from_secs(3 * 3600 + 5)),
             "03:00:05"
+        );
+    }
+
+    #[test]
+    fn recovery_dialog() {
+        let files = [PathBuf::from("/calls/2026-10-21_14-00.flac.part")];
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| draw_recovery(frame, &files, None))
+            .unwrap();
+        find(&terminal, "/calls/2026-10-21_14-00.flac.part");
+        find(
+            &terminal,
+            "[y] Восстановить   [d] Удалить   [l] Оставить на потом",
+        );
+        terminal
+            .draw(|frame| draw_recovery(frame, &files, Some("Восстановление…")))
+            .unwrap();
+        find(&terminal, "Восстановление…");
+
+        assert_eq!(recovery_choice(key('y')), Some(RecoveryChoice::Recover));
+        assert_eq!(recovery_choice(key('в')), Some(RecoveryChoice::Delete));
+        assert_eq!(recovery_choice(key('l')), Some(RecoveryChoice::Later));
+        assert_eq!(recovery_choice(key('x')), None);
+        assert_eq!(
+            recovery_choice(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(RecoveryChoice::Quit)
         );
     }
 

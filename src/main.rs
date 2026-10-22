@@ -2,6 +2,8 @@
 
 // Wired into the application in later stages (spec 7.1).
 #[allow(dead_code)]
+mod app;
+#[allow(dead_code)]
 mod mixer;
 #[allow(dead_code)]
 mod pw;

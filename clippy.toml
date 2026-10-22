@@ -2,3 +2,5 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+# Project names written as in their docs, not as code.
+doc-valid-idents = ["PipeWire", "WirePlumber", ".."]

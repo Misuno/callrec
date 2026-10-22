@@ -47,6 +47,10 @@
         };
       });
 
-      formatter = forAllSystems (pkgs: pkgs.nixfmt-rfc-style);
+      packages = forAllSystems (pkgs: {
+        default = pkgs.callPackage ./default.nix { };
+      });
+
+      formatter = forAllSystems (pkgs: pkgs.nixfmt);
     };
 }

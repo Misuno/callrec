@@ -241,6 +241,7 @@ callrec/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── default.nix          # Nix-пакет (раздел 8)
+├── flake.nix            # dev shell и packages.default
 └── src/
     ├── main.rs          # запуск потоков, обработка сигналов, восстановление терминала
     ├── pw.rs            # PipeWire: MainLoop, потоки захвата, registry, metadata
@@ -270,21 +271,25 @@ callrec/
 4. **`app.rs`** — конечный автомат `Idle → Recording ⇄ Paused → Saving → Idle`, команды, журнал событий, таймер без пауз, подсветка «нет устройства» и тишины (разделы 6.2, 6.3). Тесты переходов состояний без UI.
 5. **`ui.rs`** — экран из раздела 3, клавиши, мышь, приглушённые недоступные кнопки, индикаторы с peak hold.
 6. **`main.rs`** — запуск потоков, `Ctrl+C` и `SIGTERM`, panic hook с восстановлением терминала, подтверждение выхода во время записи, диалог восстановления `.flac.part` при запуске (раздел 6.7).
-7. **`default.nix`** — Nix-пакет (раздел 8), подключение в home-manager.
+7. **`default.nix`** — Nix-пакет (раздел 8), подключение в конфигурацию NixOS через вход flake.
 8. **Приёмка** — пройти все пункты раздела 9 в наушниках.
 
 ## 8. Сборка в NixOS
 
-Разместить проект в репозитории конфигурации, например `~/nixos/pkgs/callrec/`.
+Пакет живёт в репозитории проекта (`https://github.com/Misuno/callrec`): `default.nix` описывает сборку, `flake.nix` отдаёт его как `packages.<system>.default`.
 
 ```nix
-# pkgs/callrec/default.nix
+# default.nix
 { lib, rustPlatform, pkg-config, pipewire, flac, makeWrapper }:
 
 rustPlatform.buildRustPackage {
   pname = "callrec";
   version = "0.1.0";
-  src = ./.;
+  # Только исходники: правки спеки и Nix-файлов не пересобирают пакет
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./clippy.toml ./src ];
+  };
   cargoLock.lockFile = ./Cargo.lock;
 
   nativeBuildInputs = [
@@ -293,6 +298,7 @@ rustPlatform.buildRustPackage {
     makeWrapper
   ];
   buildInputs = [ pipewire ];
+  nativeCheckInputs = [ flac ]; # тесты writer запускают настоящий flac
 
   postInstall = ''
     wrapProgram $out/bin/callrec --prefix PATH : ${lib.makeBinPath [ flac ]}
@@ -302,22 +308,29 @@ rustPlatform.buildRustPackage {
 }
 ```
 
-Подключение в home-manager (например, в `users/misuno/apps/communication.nix`):
+Проверка: `nix build` в каталоге проекта, результат — `./result/bin/callrec`.
+
+Подключение в конфигурации системы (`~/nixos`) — вход flake:
 
 ```nix
-home.packages = [ (pkgs.callPackage ../../../pkgs/callrec { }) ];
+# flake.nix
+inputs.callrec.url = "github:Misuno/callrec";
+inputs.callrec.inputs.nixpkgs.follows = "nixpkgs";
 ```
+
+и пакет в `users/misuno/apps/communication.nix` (модулю нужен аргумент `inputs` из `specialArgs`):
+
+```nix
+environment.systemPackages = [
+  inputs.callrec.packages.${pkgs.stdenv.hostPlatform.system}.default
+];
+```
+
+Обновление после пуша в GitHub: `nix flake update callrec` в `~/nixos`, затем `nixos-rebuild switch`.
 
 Файлы проекта (включая `Cargo.lock`) должны быть добавлены в git (`git add`), иначе flake их не увидит.
 
-Среда разработки без пересборки системы:
-
-```bash
-nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#pipewire.dev \
-  nixpkgs#clang nixpkgs#flac
-export LIBCLANG_PATH="$(nix eval --raw nixpkgs#libclang.lib)/lib"
-cargo run
-```
+Среда разработки: `nix develop` (или direnv) в каталоге проекта.
 
 ## 9. Критерии приёмки
 

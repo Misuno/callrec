@@ -20,9 +20,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use chrono::Local;
 use crossbeam_channel::TryRecvError;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -34,6 +38,8 @@ use crate::ui::{RecoveryChoice, Ui, UiAction};
 const FRAME: Duration = Duration::from_millis(50);
 /// Lock file that keeps a second instance from touching our `.flac.part`.
 const LOCK_FILE: &str = ".callrec.lock";
+/// Whether keyboard enhancement flags were pushed and must be popped.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -100,6 +106,7 @@ fn run_session(
     let first = snapshot_rx.recv().context("поток записи завершился")?;
     let mut log = first.log.clone();
     let mut ui = Ui::new(first, Instant::now());
+    ui.set_enter_on_release(KEYBOARD_ENHANCED.load(Ordering::Relaxed));
     let mut terminal_ok = true;
     let mut quitting = false;
     // Asks the recorder thread to save and exit; the loop then waits for it.
@@ -255,7 +262,9 @@ fn lock_instance(dir: &Path) -> anyhow::Result<File> {
     }
 }
 
-/// Raw mode, alternate screen and mouse capture, undone on drop.
+/// Raw mode, alternate screen, mouse capture and, where the terminal supports
+/// it, the kitty keyboard protocol with key release reports (so Enter acts on
+/// release, spec 3); undone on drop.
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -264,6 +273,20 @@ impl TerminalGuard {
         // From here on Drop restores the terminal, also if the next call fails.
         let guard = Self;
         crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        // Enter, Tab and Backspace report releases only when all keys are sent
+        // as escape codes; alternate keys keep Shift+letter an uppercase letter.
+        if supports_keyboard_enhancement().unwrap_or(false) {
+            crossterm::execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                )
+            )?;
+            KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+        }
         Ok(guard)
     }
 }
@@ -276,6 +299,9 @@ impl Drop for TerminalGuard {
 
 fn restore_terminal() {
     // Best effort: there is nowhere left to report a failure.
+    if KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed) {
+        let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
     let _ = crossterm::execute!(
         io::stdout(),

@@ -16,8 +16,8 @@ use crate::mixer::{Block, Channel, Mixer, TICK, TickClock};
 use crate::pw::{Device, PcmChunk, PwEvent};
 use crate::writer::{self, Recording, Saved, WriteOutcome, WriterError};
 
-/// Number of events kept in the log (spec 3).
-pub const LOG_LINES: usize = 3;
+/// Number of events kept in the log; the UI shows as many as fit (spec 3).
+pub const LOG_CAPACITY: usize = 100;
 /// A channel quieter than this while recording counts as silent (spec 6.3).
 pub const SILENCE_THRESHOLD_DB: f64 = -60.0;
 /// How long a channel must stay silent before it is highlighted (spec 6.3).
@@ -31,16 +31,25 @@ pub enum State {
     Saving,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// `r`: start recording.
+    /// Space while idle: start recording.
     Start,
-    /// `p`: pause or resume.
+    /// Space while recording or paused: pause or resume.
     TogglePause,
-    /// `s`: stop and save.
-    Stop,
+    /// Pause before a dialog about the recording; nothing if already paused.
+    Pause,
+    /// "Save" in the save dialog: stop the recording and save it.
+    Save,
+    /// "Delete" in the delete dialog: stop the recording and delete it.
+    Discard,
     /// `q` (after confirmation), Ctrl+C, SIGTERM: save if recording, exit.
+    /// A recording that was not saved by the user is marked as interrupted
+    /// (spec 5.7).
     Quit,
+    /// The meeting title was edited. It names the files when the recording
+    /// is saved, so it can be changed at any time (spec 3, 5.7).
+    SetTitle(String),
 }
 
 /// Device a capture stream is linked to, as far as the app knows.
@@ -94,18 +103,27 @@ pub struct Snapshot {
 pub trait Storage {
     type Recorder: Recorder;
     fn has_enough_space(&self) -> Result<bool, WriterError>;
-    fn start(&self, at: DateTime<Local>) -> Result<Self::Recorder, WriterError>;
+    fn start(&self, at: DateTime<Local>, title: &str) -> Result<Self::Recorder, WriterError>;
 }
 
 /// A recording in progress. Implemented by [`Recording`] and by test fakes.
 pub trait Recorder {
-    fn path(&self) -> PathBuf;
+    /// Where the recording is saved if it is stopped with `title`.
+    fn path_for(&self, title: &str) -> PathBuf;
     fn duration(&self) -> Duration;
     fn write_block(&mut self, stereo: &[i16]) -> Result<WriteOutcome, WriterError>;
     fn pause(&mut self, at: DateTime<Local>);
     fn resume(&mut self, at: DateTime<Local>);
     fn device_change(&mut self, channel: Channel, device: &str, description: &str);
-    fn stop(self, at: DateTime<Local>) -> Result<Saved, WriterError>;
+    /// `interrupted`: the app closed without the recording being stopped.
+    fn stop(
+        self,
+        at: DateTime<Local>,
+        title: &str,
+        interrupted: bool,
+    ) -> Result<Saved, WriterError>;
+    /// Stops and deletes all files of the recording.
+    fn discard(self) -> Result<(), WriterError>;
 }
 
 /// Recordings in a directory on disk (`~/Calls`).
@@ -128,14 +146,14 @@ impl Storage for DiskStorage {
         writer::has_enough_space(&self.dir)
     }
 
-    fn start(&self, at: DateTime<Local>) -> Result<Recording, WriterError> {
-        Recording::start(&self.dir, at)
+    fn start(&self, at: DateTime<Local>, title: &str) -> Result<Recording, WriterError> {
+        Recording::start(&self.dir, at, title)
     }
 }
 
 impl Recorder for Recording {
-    fn path(&self) -> PathBuf {
-        Recording::path(self)
+    fn path_for(&self, title: &str) -> PathBuf {
+        Recording::path_for(self, title)
     }
 
     fn duration(&self) -> Duration {
@@ -158,8 +176,17 @@ impl Recorder for Recording {
         Recording::device_change(self, channel, device, description);
     }
 
-    fn stop(self, at: DateTime<Local>) -> Result<Saved, WriterError> {
-        Recording::stop(self, at)
+    fn stop(
+        self,
+        at: DateTime<Local>,
+        title: &str,
+        interrupted: bool,
+    ) -> Result<Saved, WriterError> {
+        Recording::stop(self, at, title, interrupted)
+    }
+
+    fn discard(self) -> Result<(), WriterError> {
+        Recording::discard(self)
     }
 }
 
@@ -199,6 +226,12 @@ pub struct App<S: Storage> {
     storage: S,
     state: State,
     recorder: Option<S::Recorder>,
+    /// Meeting title for the file name; empty for none.
+    title: String,
+    /// The app quit without the user saving the recording.
+    interrupted: bool,
+    /// The recording in `Saving` is deleted instead of saved.
+    discarding: bool,
     /// Path and duration of the last recording, shown after it is saved.
     last_path: Option<PathBuf>,
     last_duration: Duration,
@@ -215,11 +248,14 @@ impl<S: Storage> App<S> {
             storage,
             state: State::Idle,
             recorder: None,
+            title: String::new(),
+            interrupted: false,
+            discarding: false,
             last_path: None,
             last_duration: Duration::ZERO,
             mic: ChannelState::new(),
             them: ChannelState::new(),
-            log: VecDeque::with_capacity(LOG_LINES + 1),
+            log: VecDeque::with_capacity(LOG_CAPACITY + 1),
             write_error: None,
         }
     }
@@ -231,24 +267,38 @@ impl<S: Storage> App<S> {
 
     /// Whether a command does anything in the current state (spec 3).
     #[must_use]
-    pub fn allows(&self, command: Command) -> bool {
+    pub fn allows(&self, command: &Command) -> bool {
         allows(self.state, command)
     }
 
-    /// Handles a command. `Stop` and `Quit` while recording leave the app in
-    /// `Saving`; call [`App::finish_saving`] after the UI has shown it.
+    /// Handles a command. `Save`, `Discard` and `Quit` with a recording leave
+    /// the app in `Saving`; call [`App::finish_saving`] after the UI has
+    /// shown it.
     pub fn command(&mut self, command: Command, now: DateTime<Local>) {
-        if !self.allows(command) {
+        if !self.allows(&command) {
             return;
         }
         match command {
             Command::Start => self.start(now),
             Command::TogglePause => self.toggle_pause(now),
-            Command::Stop | Command::Quit => {
+            Command::Pause => {
+                if self.state == State::Recording {
+                    self.toggle_pause(now);
+                }
+            }
+            Command::Save => self.state = State::Saving,
+            Command::Discard => {
+                self.discarding = true;
+                self.state = State::Saving;
+            }
+            Command::Quit => {
                 if self.recorder.is_some() {
+                    // Not saved by the user: keep it, marked (spec 5.7).
+                    self.interrupted = true;
                     self.state = State::Saving;
                 }
             }
+            Command::SetTitle(title) => self.title = title,
         }
     }
 
@@ -265,14 +315,14 @@ impl<S: Storage> App<S> {
             ),
             Err(e) => self.log(now, Severity::Warning, format!("Свободное место: {e}")),
         }
-        match self.storage.start(now) {
+        match self.storage.start(now, &self.title) {
             Ok(mut recorder) => {
                 for (channel, state) in [(Channel::Mic, &self.mic), (Channel::Them, &self.them)] {
                     if let DeviceStatus::Linked(device) = &state.device {
                         recorder.device_change(channel, &device.name, &device.description);
                     }
                 }
-                self.last_path = Some(recorder.path());
+                self.last_path = None;
                 self.last_duration = Duration::ZERO;
                 self.recorder = Some(recorder);
                 self.state = State::Recording;
@@ -308,12 +358,28 @@ impl<S: Storage> App<S> {
             return;
         }
         self.state = State::Idle;
+
+        let interrupted = std::mem::take(&mut self.interrupted);
+        let discarding = std::mem::take(&mut self.discarding);
         let Some(recorder) = self.recorder.take() else {
             return;
         };
+        if discarding {
+            self.last_path = None;
+            self.last_duration = Duration::ZERO;
+            match recorder.discard() {
+                Ok(()) => self.log(now, Severity::Warning, "Запись удалена".into()),
+                Err(e) => self.log(now, Severity::Error, format!("Запись не удалена: {e}")),
+            }
+            return;
+        }
         self.last_duration = recorder.duration();
-        match recorder.stop(now) {
+        self.last_path = Some(recorder.path_for(&self.title));
+        match recorder.stop(now, &self.title, interrupted) {
             Ok(saved) => {
+                if let Some(first) = saved.files.first() {
+                    self.last_path = Some(first.clone());
+                }
                 let files = saved
                     .files
                     .iter()
@@ -425,7 +491,7 @@ impl<S: Storage> App<S> {
 
     fn log(&mut self, at: DateTime<Local>, severity: Severity, text: String) {
         self.log.push_back(LogEntry { at, text, severity });
-        while self.log.len() > LOG_LINES {
+        while self.log.len() > LOG_CAPACITY {
             self.log.pop_front();
         }
     }
@@ -444,7 +510,11 @@ impl<S: Storage> App<S> {
                 .recorder
                 .as_ref()
                 .map_or(self.last_duration, Recorder::duration),
-            path: self.last_path.clone(),
+            path: self
+                .recorder
+                .as_ref()
+                .map(|recorder| recorder.path_for(&self.title))
+                .or_else(|| self.last_path.clone()),
             mic: self.mic.view(recording),
             them: self.them.view(recording),
             log: self.log.iter().cloned().collect(),
@@ -455,11 +525,13 @@ impl<S: Storage> App<S> {
 /// Whether a command does anything in `state` (spec 3). The UI dims the
 /// buttons for which this is false.
 #[must_use]
-pub fn allows(state: State, command: Command) -> bool {
+pub fn allows(state: State, command: &Command) -> bool {
     match command {
         Command::Start => state == State::Idle,
-        Command::TogglePause | Command::Stop => matches!(state, State::Recording | State::Paused),
-        Command::Quit => true,
+        Command::TogglePause | Command::Pause | Command::Save | Command::Discard => {
+            matches!(state, State::Recording | State::Paused)
+        }
+        Command::Quit | Command::SetTitle(_) => true,
     }
 }
 
@@ -522,12 +594,13 @@ pub fn run<S: Storage>(
             },
             recv(commands) -> command => {
                 let command = command.unwrap_or(Command::Quit);
+                let quit = command == Command::Quit;
                 app.command(command, Local::now());
                 if app.state() == State::Saving {
                     publish(app);
                     app.finish_saving(Local::now());
                 }
-                if command == Command::Quit {
+                if quit {
                     publish(app);
                     return;
                 }
@@ -555,12 +628,13 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq)]
     enum Call {
-        Start,
+        Start(String),
         Write,
         Pause,
         Resume,
         Device(Channel, String),
-        Stop,
+        Stop(String, bool),
+        Discard,
     }
 
     #[derive(Debug, Default)]
@@ -592,9 +666,9 @@ mod tests {
             self.0.borrow().space.ok_or_else(io_error)
         }
 
-        fn start(&self, _at: DateTime<Local>) -> Result<FakeRecorder, WriterError> {
+        fn start(&self, _at: DateTime<Local>, title: &str) -> Result<FakeRecorder, WriterError> {
             let mut fake = self.0.borrow_mut();
-            fake.calls.push(Call::Start);
+            fake.calls.push(Call::Start(title.to_owned()));
             if fake.fail_start {
                 return Err(io_error());
             }
@@ -603,8 +677,8 @@ mod tests {
     }
 
     impl Recorder for FakeRecorder {
-        fn path(&self) -> PathBuf {
-            PathBuf::from("/calls/2026-10-21_14-00.flac")
+        fn path_for(&self, title: &str) -> PathBuf {
+            fake_path(title, "flac")
         }
 
         fn duration(&self) -> Duration {
@@ -643,17 +717,33 @@ mod tests {
                 .push(Call::Device(channel, device.to_owned()));
         }
 
-        fn stop(self, _at: DateTime<Local>) -> Result<Saved, WriterError> {
+        fn stop(
+            self,
+            _at: DateTime<Local>,
+            title: &str,
+            interrupted: bool,
+        ) -> Result<Saved, WriterError> {
             let mut fake = self.0.borrow_mut();
-            fake.calls.push(Call::Stop);
+            fake.calls.push(Call::Stop(title.to_owned(), interrupted));
             if fake.fail_stop {
                 return Err(io_error());
             }
             Ok(Saved {
-                files: vec![PathBuf::from("/calls/2026-10-21_14-00.flac")],
-                metadata: PathBuf::from("/calls/2026-10-21_14-00.json"),
+                files: vec![fake_path(title, "flac")],
+                metadata: fake_path(title, "json"),
             })
         }
+
+        fn discard(self) -> Result<(), WriterError> {
+            self.0.borrow_mut().calls.push(Call::Discard);
+            Ok(())
+        }
+    }
+
+    /// File names as the real writer makes them.
+    fn fake_path(title: &str, extension: &str) -> PathBuf {
+        let base = writer::file_base(title, at(0));
+        PathBuf::from(format!("/calls/{base}.{extension}"))
     }
 
     fn at(secs: i64) -> DateTime<Local> {
@@ -701,13 +791,13 @@ mod tests {
     fn full_cycle() {
         let (mut app, fake) = app();
         assert_eq!(app.state(), State::Idle);
-        assert!(app.allows(Command::Start));
-        assert!(!app.allows(Command::TogglePause));
-        assert!(!app.allows(Command::Stop));
+        assert!(app.allows(&Command::Start));
+        assert!(!app.allows(&Command::TogglePause));
+        assert!(!app.allows(&Command::Save));
 
         app.command(Command::Start, at(0));
         assert_eq!(app.state(), State::Recording);
-        assert!(!app.allows(Command::Start));
+        assert!(!app.allows(&Command::Start));
         app.block(&block(-20.0, -30.0), at(0));
 
         app.command(Command::TogglePause, at(1));
@@ -717,21 +807,21 @@ mod tests {
         assert_eq!(app.state(), State::Recording);
         app.block(&block(-20.0, -30.0), at(2));
 
-        app.command(Command::Stop, at(3));
+        // Saved straight from recording.
+        app.command(Command::Save, at(3));
         assert_eq!(app.state(), State::Saving);
-        assert!(!app.allows(Command::Stop));
         app.finish_saving(at(3));
         assert_eq!(app.state(), State::Idle);
 
         assert_eq!(
             calls(&fake),
             vec![
-                Call::Start,
+                Call::Start(String::new()),
                 Call::Write,
                 Call::Pause,
                 Call::Resume,
                 Call::Write,
-                Call::Stop
+                Call::Stop(String::new(), false)
             ]
         );
         let snapshot = app.snapshot();
@@ -744,15 +834,71 @@ mod tests {
     }
 
     #[test]
+    fn discard_deletes_instead_of_saving() {
+        let (mut app, fake) = app();
+        assert!(!app.allows(&Command::Discard));
+        app.command(Command::Start, at(0));
+        app.block(&block(-20.0, -30.0), at(1));
+        app.command(Command::Discard, at(2));
+        assert_eq!(app.state(), State::Saving);
+        app.finish_saving(at(2));
+
+        assert_eq!(app.state(), State::Idle);
+        assert_eq!(
+            calls(&fake),
+            vec![Call::Start(String::new()), Call::Write, Call::Discard]
+        );
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.path, None);
+        assert_eq!(snapshot.duration, Duration::ZERO);
+        assert_eq!(texts(&app), ["Запись удалена"]);
+
+        // The next stop saves again.
+        app.command(Command::Start, at(3));
+        app.command(Command::Save, at(4));
+        app.finish_saving(at(4));
+        assert_eq!(calls(&fake).last(), Some(&Call::Stop(String::new(), false)));
+    }
+
+    #[test]
+    fn title_can_change_at_any_time() {
+        let (mut app, fake) = app();
+        assert!(app.allows(&Command::SetTitle(String::new())));
+        app.command(Command::SetTitle("Планёрка".into()), at(0));
+        app.command(Command::Start, at(0));
+        assert_eq!(app.snapshot().path, Some(fake_path("Планёрка", "flac")));
+
+        app.command(Command::TogglePause, at(1));
+        app.command(Command::SetTitle("Ретро".into()), at(2));
+        assert_eq!(app.snapshot().path, Some(fake_path("Ретро", "flac")));
+        app.command(Command::Save, at(3));
+        app.finish_saving(at(3));
+
+        assert_eq!(
+            calls(&fake),
+            vec![
+                Call::Start("Планёрка".into()),
+                Call::Pause,
+                Call::Stop("Ретро".into(), false)
+            ]
+        );
+        assert_eq!(app.snapshot().path, Some(fake_path("Ретро", "flac")));
+        // The next recording starts with the title as it is now.
+        app.command(Command::Start, at(4));
+        assert_eq!(calls(&fake), vec![Call::Start("Ретро".into())]);
+    }
+
+    #[test]
     fn commands_outside_their_states_are_ignored() {
         let (mut app, fake) = app();
         app.command(Command::TogglePause, at(0));
-        app.command(Command::Stop, at(0));
+        app.command(Command::Save, at(0));
+        app.command(Command::Discard, at(0));
         app.finish_saving(at(0));
         assert_eq!(app.state(), State::Idle);
         app.command(Command::Start, at(0));
         app.command(Command::Start, at(1));
-        assert_eq!(calls(&fake), vec![Call::Start]);
+        assert_eq!(calls(&fake), vec![Call::Start(String::new())]);
     }
 
     #[test]
@@ -795,7 +941,7 @@ mod tests {
         let (mut app, fake) = app();
         fake.borrow_mut().fail_stop = true;
         app.command(Command::Start, at(0));
-        app.command(Command::Stop, at(1));
+        app.command(Command::Save, at(1));
         app.finish_saving(at(1));
         assert_eq!(app.state(), State::Idle);
         assert_eq!(
@@ -807,14 +953,26 @@ mod tests {
     }
 
     #[test]
-    fn quit_while_paused_saves() {
+    fn quit_while_paused_saves_as_interrupted() {
         let (mut app, fake) = app();
         app.command(Command::Start, at(0));
         app.command(Command::TogglePause, at(1));
         app.command(Command::Quit, at(2));
         assert_eq!(app.state(), State::Saving);
         app.finish_saving(at(2));
-        assert_eq!(calls(&fake).last(), Some(&Call::Stop));
+        assert_eq!(calls(&fake).last(), Some(&Call::Stop(String::new(), true)));
+    }
+
+    #[test]
+    fn pause_command_only_pauses() {
+        let (mut app, fake) = app();
+        assert!(!app.allows(&Command::Pause));
+        app.command(Command::Start, at(0));
+        app.command(Command::Pause, at(1));
+        assert_eq!(app.state(), State::Paused);
+        app.command(Command::Pause, at(2));
+        assert_eq!(app.state(), State::Paused);
+        assert_eq!(calls(&fake), vec![Call::Start(String::new()), Call::Pause]);
     }
 
     #[test]
@@ -848,7 +1006,7 @@ mod tests {
         assert_eq!(
             calls(&fake),
             vec![
-                Call::Start,
+                Call::Start(String::new()),
                 Call::Device(Channel::Mic, "alsa_input.pci".into()),
                 Call::Device(Channel::Mic, "bluez_input.70".into()),
             ]
@@ -971,10 +1129,16 @@ mod tests {
     #[test]
     fn log_keeps_last_entries() {
         let (mut app, _fake) = app();
-        for i in 0..5 {
-            app.notify(at(i), Severity::Info, format!("{i}"));
+        let total = LOG_CAPACITY + 2;
+        for i in 0..total {
+            app.notify(
+                at(i64::try_from(i).unwrap()),
+                Severity::Info,
+                format!("{i}"),
+            );
         }
-        assert_eq!(texts(&app), ["2", "3", "4"]);
+        let expected: Vec<String> = (2..total).map(|i| i.to_string()).collect();
+        assert_eq!(texts(&app), expected);
     }
 
     #[test]
@@ -1018,7 +1182,7 @@ mod tests {
         assert!(states.contains(&State::Recording), "{states:?}");
         assert!(states.contains(&State::Saving), "{states:?}");
         assert_eq!(states.last(), Some(&State::Idle));
-        assert_eq!(calls(&fake).last(), Some(&Call::Stop));
+        assert_eq!(calls(&fake).last(), Some(&Call::Stop(String::new(), true)));
     }
 
     #[test]

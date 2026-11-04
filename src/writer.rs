@@ -37,6 +37,14 @@ const STDERR_LIMIT: u64 = 4096;
 const PART_SUFFIX: &str = ".part";
 /// Suffix of an unfinished recording (spec 6.6).
 const UNFINISHED_SUFFIX: &str = ".flac.part";
+/// Longest meeting title kept in a file name, in bytes. Names stay well below
+/// the 255-byte limit with the date, suffixes and extensions added.
+pub const MAX_TITLE_BYTES: usize = 150;
+/// Start time in file names.
+const NAME_TIME_FORMAT: &str = "%Y-%m-%d_%H-%M";
+/// Added to the name of a recording that was not stopped before the app
+/// closed (spec 5.7).
+pub const INTERRUPTED_MARK: &str = "прервано";
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriterError {
@@ -104,6 +112,9 @@ pub struct DeviceChange {
 
 #[derive(Debug, Serialize)]
 struct Metadata<'a> {
+    title: &'a str,
+    /// The app closed without stopping the recording.
+    interrupted: bool,
     started_at: String,
     finished_at: String,
     duration_sec: f64,
@@ -140,9 +151,14 @@ pub struct Saved {
 /// `flac` fails, the current segment is kept as `<stem>-part<N>.flac` and
 /// recording continues in `<stem>-part<N+1>.flac.part`. Positions (`at_sec`)
 /// count the audio written so far across all segments, without pauses.
+///
+/// The stem is `<title>_<start time>` (see [`file_base`]). The title may change
+/// while recording; [`Recording::stop`] renames the files to the final one.
 #[derive(Debug)]
 pub struct Recording {
     dir: PathBuf,
+    /// Name the stem was made from, before a `-2`, `-3` suffix.
+    base: String,
     stem: String,
     started_at: DateTime<Local>,
     encoder: Option<FlacEncoder>,
@@ -157,12 +173,19 @@ pub struct Recording {
 }
 
 impl Recording {
-    /// Creates `dir`, picks a free file name from `started_at` and starts `flac`.
-    pub fn start(dir: &Path, started_at: DateTime<Local>) -> Result<Self, WriterError> {
+    /// Creates `dir`, picks a free file name from `title` and `started_at` and
+    /// starts `flac`.
+    pub fn start(
+        dir: &Path,
+        started_at: DateTime<Local>,
+        title: &str,
+    ) -> Result<Self, WriterError> {
         fs::create_dir_all(dir).map_err(io_err("создание каталога", dir))?;
-        let stem = unique_stem(dir, &started_at.format("%Y-%m-%d_%H-%M").to_string())?;
+        let base = file_base(title, started_at);
+        let stem = unique_stem(dir, &base)?;
         let mut recording = Self {
             dir: dir.to_path_buf(),
+            base,
             stem,
             started_at,
             encoder: None,
@@ -178,10 +201,22 @@ impl Recording {
         Ok(recording)
     }
 
-    /// Final path of the recording, as shown in the UI.
+    /// Path of the recording under its current stem.
     #[must_use]
     pub fn path(&self) -> PathBuf {
         self.dir.join(format!("{}.flac", self.stem))
+    }
+
+    /// Path the recording gets when it is stopped with `title`, as shown in
+    /// the UI. A `-2` suffix for a taken name is only picked at stop.
+    #[must_use]
+    pub fn path_for(&self, title: &str) -> PathBuf {
+        let base = file_base(title, self.started_at);
+        if base == self.base {
+            self.path()
+        } else {
+            self.dir.join(format!("{base}.flac"))
+        }
     }
 
     /// Recorded audio so far, without pauses.
@@ -260,10 +295,25 @@ impl Recording {
 
     /// Finishes `flac`, renames the segment to `.flac` and writes the JSON.
     /// If `flac` fails here, the segment stays `.flac.part` so it is offered
-    /// for recovery at the next start; the JSON is written anyway.
-    pub fn stop(mut self, finished_at: DateTime<Local>) -> Result<Saved, WriterError> {
-        self.resume(finished_at);
-        let mut failure = None;
+    /// for recovery at the next start; the JSON is written anyway. Files are
+    /// named after `title`; if it changed since the start, segments saved
+    /// earlier are renamed. A file that cannot be renamed keeps its name.
+    /// `interrupted`: the app was closed without stopping the recording; the
+    /// name gets `INTERRUPTED_MARK` (spec 5.7).
+    pub fn stop(
+        mut self,
+        finished_at: DateTime<Local>,
+        title: &str,
+        interrupted: bool,
+    ) -> Result<Saved, WriterError> {
+        // Saved while paused: the audio ends where the pause began, and the
+        // time after it is not a pause within the recording.
+        let finished_at = self.paused_at.take().unwrap_or(finished_at);
+        let mut base = file_base(title, self.started_at);
+        if interrupted {
+            base = format!("{base}_{INTERRUPTED_MARK}");
+        }
+        let mut failure = self.retitle(base).err();
         if let Some(encoder) = self.encoder.take() {
             let part = encoder.part.clone();
             let target = self.segment_path();
@@ -272,16 +322,16 @@ impl Recording {
                     Ok(()) => self.files.push(target),
                     Err(e) => {
                         self.files.push(part.clone());
-                        failure = Some(io_err("переименование", &part)(e));
+                        failure.get_or_insert(io_err("переименование", &part)(e));
                     }
                 },
                 Err(e) => {
                     self.files.push(part);
-                    failure = Some(e);
+                    failure.get_or_insert(e);
                 }
             }
         }
-        let metadata = self.write_metadata(finished_at);
+        let metadata = self.write_metadata(finished_at, title.trim(), interrupted);
         match (failure, metadata) {
             (None, Ok(metadata)) => Ok(Saved {
                 files: self.files,
@@ -289,6 +339,63 @@ impl Recording {
             }),
             (Some(e), _) | (None, Err(e)) => Err(e),
         }
+    }
+
+    /// Stops `flac` and deletes every file of this recording: the running
+    /// segment and the ones saved after `flac` failures. No metadata is
+    /// written. Only on an explicit user choice (spec 3, 6.6). Files that
+    /// cannot be deleted stay; the first error is returned.
+    pub fn discard(mut self) -> Result<(), WriterError> {
+        if let Some(encoder) = self.encoder.take() {
+            self.files.push(encoder.part.clone());
+            // The file is deleted, so how flac ended does not matter.
+            let _ = encoder.abort();
+        }
+        let mut failure = None;
+        for file in &self.files {
+            match fs::remove_file(file) {
+                // flac creates its file only after the first input.
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    failure.get_or_insert(io_err("удаление", file)(e));
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Moves the recording to a stem made from `base`: renames the segments saved
+    /// so far. The running segment is renamed when it is finished. On error
+    /// the files that could not be renamed keep their old names.
+    fn retitle(&mut self, base: String) -> Result<(), WriterError> {
+        if base == self.base {
+            return Ok(());
+        }
+        let stem = unique_stem(&self.dir, &base)?;
+        let mut failure = None;
+        let files = std::mem::take(&mut self.files);
+        for file in files {
+            let renamed = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(self.stem.as_str()))
+                .map(|rest| self.dir.join(format!("{stem}{rest}")));
+            let Some(target) = renamed else {
+                self.files.push(file);
+                continue;
+            };
+            match rename_new(&file, &target) {
+                Ok(()) => self.files.push(target),
+                Err(e) => {
+                    failure.get_or_insert(io_err("переименование", &file)(e));
+                    self.files.push(file);
+                }
+            }
+        }
+        self.base = base;
+        self.stem = stem;
+        failure.map_or(Ok(()), Err)
     }
 
     /// Final path of the current segment.
@@ -348,10 +455,17 @@ impl Recording {
         WriteOutcome::Restarted { saved, cause }
     }
 
-    fn write_metadata(&self, finished_at: DateTime<Local>) -> Result<PathBuf, WriterError> {
+    fn write_metadata(
+        &self,
+        finished_at: DateTime<Local>,
+        title: &str,
+        interrupted: bool,
+    ) -> Result<PathBuf, WriterError> {
         let path = self.dir.join(format!("{}.json", self.stem));
         let part = with_suffix(&path, PART_SUFFIX);
         let metadata = Metadata {
+            title,
+            interrupted,
             started_at: self.started_at.to_rfc3339_opts(SecondsFormat::Secs, false),
             finished_at: finished_at.to_rfc3339_opts(SecondsFormat::Secs, false),
             duration_sec: seconds(self.duration()),
@@ -653,6 +767,29 @@ pub fn discard(part: &Path) -> Result<(), WriterError> {
     fs::remove_file(part).map_err(io_err("удаление", part))
 }
 
+/// File name of a recording without extension: `<title>_<start time>`, or
+/// just the start time without a title. The title is made safe for a file
+/// name: no `/`, control characters or leading dots, at most
+/// `MAX_TITLE_BYTES`.
+#[must_use]
+pub fn file_base(title: &str, started_at: DateTime<Local>) -> String {
+    let time = started_at.format(NAME_TIME_FORMAT);
+    let mut safe = String::new();
+    for c in title.trim().chars() {
+        let c = if c == '/' { '-' } else { c };
+        if c.is_control() || safe.len() + c.len_utf8() > MAX_TITLE_BYTES {
+            continue;
+        }
+        safe.push(c);
+    }
+    let safe = safe.trim_start_matches('.').trim();
+    if safe.is_empty() {
+        time.to_string()
+    } else {
+        format!("{safe}_{time}")
+    }
+}
+
 /// First of `base`, `base-2`, `base-3`, … that no file in `dir` uses.
 fn unique_stem(dir: &Path, base: &str) -> Result<String, WriterError> {
     let names: Vec<String> = fs::read_dir(dir)
@@ -802,7 +939,7 @@ mod tests {
     #[test]
     fn records_flac_and_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let mut rec = Recording::start(dir.path(), at(0)).unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "").unwrap();
         assert_eq!(rec.path(), dir.path().join("2026-10-21_14-00.flac"));
         rec.device_change(Channel::Mic, "alsa_input.pci", "Встроенный микрофон");
         rec.device_change(Channel::Them, "alsa_output.pci", "Встроенные динамики");
@@ -811,7 +948,7 @@ mod tests {
         }
         assert_eq!(rec.duration(), Duration::from_secs(2));
 
-        let saved = rec.stop(at(5)).unwrap();
+        let saved = rec.stop(at(5), "", false).unwrap();
         let flac = dir.path().join("2026-10-21_14-00.flac");
         let json = dir.path().join("2026-10-21_14-00.json");
         assert_eq!(saved.files, vec![flac.clone()]);
@@ -838,6 +975,8 @@ mod tests {
         );
         assert_eq!(meta["files"], serde_json::json!(["2026-10-21_14-00.flac"]));
         assert_eq!(meta["pauses"], serde_json::json!([]));
+        assert_eq!(meta["interrupted"], false);
+        assert_eq!(meta["title"], "");
         assert_eq!(
             meta["device_changes"],
             serde_json::json!([
@@ -850,7 +989,7 @@ mod tests {
     #[test]
     fn positions_exclude_pauses() {
         let dir = tempfile::tempdir().unwrap();
-        let mut rec = Recording::start(dir.path(), at(0)).unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "").unwrap();
         for i in 0..15 {
             rec.write_block(&block(i)).unwrap();
         }
@@ -862,9 +1001,9 @@ mod tests {
         for i in 15..20 {
             rec.write_block(&block(i)).unwrap();
         }
-        // Paused again until the stop: the pause ends at the stop time.
+        // Saved while paused: the recording ends where the pause began.
         rec.pause(at(50));
-        let saved = rec.stop(at(55)).unwrap();
+        let saved = rec.stop(at(55), "", false).unwrap();
 
         assert_eq!(decode(&saved.files[0]), blocks(0..20));
         let meta = read_json(&saved.metadata);
@@ -873,10 +1012,13 @@ mod tests {
             meta["pauses"],
             serde_json::json!([
                 { "at_sec": 1.5, "duration_sec": 30.0 },
-                { "at_sec": 2.0, "duration_sec": 5.0 },
             ])
         );
         assert_eq!(meta["device_changes"][0]["at_sec"], 1.5);
+        assert_eq!(
+            meta["finished_at"],
+            at(50).to_rfc3339_opts(SecondsFormat::Secs, false)
+        );
     }
 
     #[test]
@@ -884,9 +1026,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("2026-10-21_14-00.flac"), b"").unwrap();
         fs::write(dir.path().join("2026-10-21_14-00-2-part1.flac"), b"").unwrap();
-        let rec = Recording::start(dir.path(), at(0)).unwrap();
+        let rec = Recording::start(dir.path(), at(0), "").unwrap();
         assert_eq!(rec.path(), dir.path().join("2026-10-21_14-00-3.flac"));
-        let saved = rec.stop(at(1)).unwrap();
+        let saved = rec.stop(at(1), "", false).unwrap();
         assert_eq!(saved.files, vec![rec_path(dir.path(), "-3.flac")]);
         assert_eq!(saved.metadata, rec_path(dir.path(), "-3.json"));
     }
@@ -903,9 +1045,151 @@ mod tests {
     }
 
     #[test]
+    fn title_goes_before_start_time() {
+        assert_eq!(file_base("", at(0)), "2026-10-21_14-00");
+        assert_eq!(file_base("   ", at(0)), "2026-10-21_14-00");
+        assert_eq!(
+            file_base("  Планёрка с Jabra ", at(0)),
+            "Планёрка с Jabra_2026-10-21_14-00"
+        );
+        // Not a path, not hidden, no control characters.
+        assert_eq!(file_base("a/b\tc\n", at(0)), "a-bc_2026-10-21_14-00");
+        assert_eq!(file_base("../x", at(0)), "-x_2026-10-21_14-00");
+        assert_eq!(file_base("..", at(0)), "2026-10-21_14-00");
+
+        let long = "я".repeat(200);
+        let base = file_base(&long, at(0));
+        let title = base.strip_suffix("_2026-10-21_14-00").unwrap();
+        assert_eq!(title, "я".repeat(MAX_TITLE_BYTES / 2));
+    }
+
+    #[test]
+    fn title_at_start_names_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "Планёрка").unwrap();
+        rec.write_block(&block(0)).unwrap();
+        let flac = dir.path().join("Планёрка_2026-10-21_14-00.flac");
+        assert_eq!(rec.path(), flac);
+        assert_eq!(rec.path_for("Планёрка"), flac);
+
+        let saved = rec.stop(at(5), "Планёрка", false).unwrap();
+        assert_eq!(saved.files, vec![flac]);
+        assert_eq!(
+            names(dir.path()),
+            [
+                "Планёрка_2026-10-21_14-00.flac",
+                "Планёрка_2026-10-21_14-00.json"
+            ]
+        );
+        assert_eq!(read_json(&saved.metadata)["title"], "Планёрка");
+    }
+
+    #[test]
+    fn title_changed_while_recording_renames_all_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "").unwrap();
+        for i in 0..3 {
+            rec.write_block(&block(i)).unwrap();
+        }
+        rec.kill_encoder();
+        rec.write_block(&block(3)).unwrap();
+        assert_eq!(
+            rec.path_for("Ретро"),
+            dir.path().join("Ретро_2026-10-21_14-00.flac")
+        );
+        // The time is the start of the recording, not the stop.
+        let saved = rec.stop(at(3600), " Ретро ", false).unwrap();
+
+        let part1 = dir.path().join("Ретро_2026-10-21_14-00-part1.flac");
+        let part2 = dir.path().join("Ретро_2026-10-21_14-00-part2.flac");
+        assert_eq!(saved.files, vec![part1.clone(), part2.clone()]);
+        assert!(part1.exists());
+        assert_eq!(decode(&part2), blocks(3..4));
+        assert_eq!(
+            saved.metadata,
+            dir.path().join("Ретро_2026-10-21_14-00.json")
+        );
+        let meta = read_json(&saved.metadata);
+        assert_eq!(meta["title"], "Ретро");
+        assert_eq!(
+            meta["files"],
+            serde_json::json!([
+                "Ретро_2026-10-21_14-00-part1.flac",
+                "Ретро_2026-10-21_14-00-part2.flac"
+            ])
+        );
+        assert_eq!(names(dir.path()).len(), 3);
+    }
+
+    #[test]
+    fn interrupted_recording_is_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "Ретро").unwrap();
+        rec.write_block(&block(0)).unwrap();
+        let saved = rec.stop(at(5), "Ретро", true).unwrap();
+        assert_eq!(
+            saved.files,
+            vec![dir.path().join("Ретро_2026-10-21_14-00_прервано.flac")]
+        );
+        let meta = read_json(&saved.metadata);
+        assert_eq!(meta["interrupted"], true);
+        assert_eq!(meta["title"], "Ретро");
+
+        let rec = Recording::start(dir.path(), at(60), "").unwrap();
+        let saved = rec.stop(at(61), "", true).unwrap();
+        assert_eq!(
+            saved.metadata,
+            dir.path().join("2026-10-21_14-01_прервано.json")
+        );
+        assert_eq!(read_json(&saved.metadata)["interrupted"], true);
+    }
+
+    #[test]
+    fn discard_deletes_only_this_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("other.flac"), b"keep").unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "").unwrap();
+        for i in 0..3 {
+            rec.write_block(&block(i)).unwrap();
+        }
+        rec.kill_encoder();
+        rec.write_block(&block(3)).unwrap();
+        assert!(dir.path().join("2026-10-21_14-00-part1.flac").exists());
+
+        rec.discard().unwrap();
+        assert_eq!(names(dir.path()), ["other.flac"]);
+    }
+
+    #[test]
+    fn discard_before_any_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Recording::start(dir.path(), at(0), "").unwrap();
+        rec.discard().unwrap();
+        assert_eq!(names(dir.path()), [] as [String; 0]);
+    }
+
+    #[test]
+    fn retitled_recording_gets_suffix_for_taken_name() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Ретро_2026-10-21_14-00.flac"), b"old").unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "").unwrap();
+        rec.write_block(&block(0)).unwrap();
+        let saved = rec.stop(at(5), "Ретро", false).unwrap();
+        assert_eq!(
+            saved.files,
+            vec![dir.path().join("Ретро_2026-10-21_14-00-2.flac")]
+        );
+        // The other recording is untouched.
+        assert_eq!(
+            fs::read(dir.path().join("Ретро_2026-10-21_14-00.flac")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
     fn flac_crash_continues_in_next_part() {
         let dir = tempfile::tempdir().unwrap();
-        let mut rec = Recording::start(dir.path(), at(0)).unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "").unwrap();
         for i in 0..3 {
             rec.write_block(&block(i)).unwrap();
         }
@@ -925,7 +1209,7 @@ mod tests {
         // The block that hit the failure is not lost.
         assert_eq!(rec.duration(), Duration::from_millis(600));
 
-        let saved = rec.stop(at(10)).unwrap();
+        let saved = rec.stop(at(10), "", false).unwrap();
         let part2 = dir.path().join("2026-10-21_14-00-part2.flac");
         assert_eq!(saved.files, vec![part1, part2.clone()]);
         assert_eq!(decode(&part2), blocks(3..6));
@@ -943,11 +1227,11 @@ mod tests {
     #[test]
     fn failed_stop_keeps_part_for_recovery() {
         let dir = tempfile::tempdir().unwrap();
-        let mut rec = Recording::start(dir.path(), at(0)).unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "").unwrap();
         rec.write_block(&block(0)).unwrap();
         rec.kill_encoder();
 
-        let err = rec.stop(at(1)).unwrap_err();
+        let err = rec.stop(at(1), "", false).unwrap_err();
         assert!(matches!(err, WriterError::Encoder { .. }), "{err}");
         let part = dir.path().join("2026-10-21_14-00.flac.part");
         assert_eq!(find_unfinished(dir.path()).unwrap(), vec![part]);
@@ -962,7 +1246,7 @@ mod tests {
     #[test]
     fn dropped_recording_leaves_decodable_part() {
         let dir = tempfile::tempdir().unwrap();
-        let mut rec = Recording::start(dir.path(), at(0)).unwrap();
+        let mut rec = Recording::start(dir.path(), at(0), "").unwrap();
         for i in 0..5 {
             rec.write_block(&block(i)).unwrap();
         }

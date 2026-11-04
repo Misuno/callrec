@@ -16,7 +16,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
-use crate::app::{self, ChannelView, Command, DeviceStatus, LogEntry, Severity, Snapshot, State};
+use crate::app::{
+    self, ChannelView, Command, DeviceStatus, LogEntry, QuitReason, Severity, Snapshot, State,
+    format_duration,
+};
 use crate::mixer::{Channel, LEVEL_FLOOR_DB};
 
 /// Lowest level the meter shows; quieter is an empty bar.
@@ -57,7 +60,7 @@ const DIALOG_BUTTON_GAP_CELLS: u16 = 3;
 pub enum UiAction {
     Command(Command),
     /// Save the recording, if any, and exit.
-    Quit,
+    Quit(QuitReason),
 }
 
 /// Questions on top of the screen (spec 3). They know nothing about each
@@ -261,7 +264,7 @@ impl Ui {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             // Ctrl+C saves and exits without asking (spec 6.7).
-            return Some(UiAction::Quit);
+            return Some(UiAction::Quit(QuitReason::CtrlC));
         }
         self.dispatch(key)
     }
@@ -386,7 +389,7 @@ impl Ui {
         self.dialog = None;
         match (dialog, button) {
             (_, DialogButton::Back) => None,
-            (_, DialogButton::Leave) => Some(UiAction::Quit),
+            (_, DialogButton::Leave) => Some(UiAction::Quit(QuitReason::User)),
             (Dialog::Save, DialogButton::Save) if self.title.trim().is_empty() => {
                 self.open(Dialog::Name);
                 None
@@ -555,7 +558,7 @@ impl Ui {
                 self.open(Dialog::Quit);
                 return None;
             }
-            Focus::Quit => return Some(UiAction::Quit),
+            Focus::Quit => return Some(UiAction::Quit(QuitReason::User)),
         };
         app::allows(state, &command).then_some(UiAction::Command(command))
     }
@@ -1176,12 +1179,6 @@ pub fn draw_recovery(frame: &mut Frame<'_>, files: &[std::path::PathBuf], progre
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// `HH:MM:SS`.
-fn format_duration(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1712,7 +1709,10 @@ mod tests {
     fn focus_skips_and_leaves_hidden_buttons() {
         let mut ui = Ui::new(snapshot(State::Idle), Instant::now());
         ui.key(code(KeyCode::Right));
-        assert_eq!(ui.key(code(KeyCode::Enter)), Some(UiAction::Quit));
+        assert_eq!(
+            ui.key(code(KeyCode::Enter)),
+            Some(UiAction::Quit(QuitReason::User))
+        );
 
         let mut ui = Ui::new(snapshot(State::Recording), Instant::now());
         ui.key(code(KeyCode::Right));
@@ -1737,7 +1737,10 @@ mod tests {
         // Idle: from the record button straight to quit.
         let mut ui = Ui::new(snapshot(State::Idle), Instant::now());
         ui.key(code(KeyCode::Tab));
-        assert_eq!(ui.key(code(KeyCode::Enter)), Some(UiAction::Quit));
+        assert_eq!(
+            ui.key(code(KeyCode::Enter)),
+            Some(UiAction::Quit(QuitReason::User))
+        );
     }
     #[test]
     fn title_is_edited_at_the_caret() {
@@ -1812,14 +1815,14 @@ mod tests {
         ui.key(code(KeyCode::Up));
         assert_eq!(
             ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Some(UiAction::Quit)
+            Some(UiAction::Quit(QuitReason::CtrlC))
         );
     }
 
     #[test]
     fn quit_while_idle_is_immediate() {
         let mut ui = Ui::new(snapshot(State::Idle), Instant::now());
-        assert_eq!(ui.key(key('q')), Some(UiAction::Quit));
+        assert_eq!(ui.key(key('q')), Some(UiAction::Quit(QuitReason::User)));
     }
 
     #[test]
@@ -1840,14 +1843,17 @@ mod tests {
         ui.key(code(KeyCode::Esc));
         ui.key(key('q'));
         ui.key(code(KeyCode::Left));
-        assert_eq!(ui.key(code(KeyCode::Enter)), Some(UiAction::Quit));
+        assert_eq!(
+            ui.key(code(KeyCode::Enter)),
+            Some(UiAction::Quit(QuitReason::User))
+        );
 
         let mut ui = Ui::new(snapshot(State::Recording), Instant::now());
         ui.key(key('q'));
         let terminal = render(&mut ui);
         assert_eq!(
             ui.mouse(click(find(&terminal, "[y] Выйти"))),
-            Some(UiAction::Quit)
+            Some(UiAction::Quit(QuitReason::User))
         );
     }
 
@@ -1958,7 +1964,7 @@ mod tests {
         ui.key(key('s'));
         assert_eq!(
             ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Some(UiAction::Quit)
+            Some(UiAction::Quit(QuitReason::CtrlC))
         );
     }
     #[test]
@@ -1966,7 +1972,7 @@ mod tests {
         let mut ui = Ui::new(snapshot(State::Recording), Instant::now());
         assert_eq!(
             ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Some(UiAction::Quit)
+            Some(UiAction::Quit(QuitReason::CtrlC))
         );
     }
     #[test]

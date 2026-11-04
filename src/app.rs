@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use crossbeam_channel::{Receiver, Sender, select};
 
-use crate::mixer::{Block, Channel, Mixer, TICK, TickClock};
+use crate::mixer::{Block, Channel, ChannelTick, Mixer, SAMPLE_RATE, TICK, TickClock};
 use crate::pw::{Device, PcmChunk, PwEvent};
 use crate::writer::{self, Recording, Saved, WriteOutcome, WriterError};
 
@@ -22,6 +22,9 @@ pub const LOG_CAPACITY: usize = 100;
 pub const SILENCE_THRESHOLD_DB: f64 = -60.0;
 /// How long a channel must stay silent before it is highlighted (spec 6.3).
 pub const SILENCE_DURATION: Duration = Duration::from_secs(60);
+/// Lost audio of a channel is logged at most this often; gaps in between
+/// are summed into one entry.
+pub const DROPOUT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -45,11 +48,38 @@ pub enum Command {
     Discard,
     /// `q` (after confirmation), Ctrl+C, SIGTERM: save if recording, exit.
     /// A recording that was not saved by the user is marked as interrupted
-    /// (spec 5.7).
-    Quit,
+    /// (spec 5.7). The reason goes to the event log.
+    Quit(QuitReason),
     /// The meeting title was edited. It names the files when the recording
     /// is saved, so it can be changed at any time (spec 3, 5.7).
     SetTitle(String),
+}
+
+/// Why the app exits; shown in the event log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitReason {
+    /// `q` or the "Exit" button (confirmed if recording).
+    User,
+    /// Ctrl+C in the terminal.
+    CtrlC,
+    /// A signal, by name (`SIGTERM`, `SIGINT`, `SIGHUP`).
+    Signal(&'static str),
+    /// The terminal cannot be drawn or read (window closed).
+    TerminalLost,
+    /// The UI thread stopped sending commands.
+    UiGone,
+}
+
+impl std::fmt::Display for QuitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User => f.write_str("по команде пользователя"),
+            Self::CtrlC => f.write_str("по Ctrl+C"),
+            Self::Signal(name) => write!(f, "по сигналу {name}"),
+            Self::TerminalLost => f.write_str("терминал недоступен"),
+            Self::UiGone => f.write_str("интерфейс завершился"),
+        }
+    }
 }
 
 /// Device a capture stream is linked to, as far as the app knows.
@@ -196,6 +226,7 @@ struct ChannelState {
     level_db: f64,
     /// Consecutive recorded blocks below `SILENCE_THRESHOLD_DB`.
     silent_blocks: u32,
+    dropouts: Dropouts,
 }
 
 impl ChannelState {
@@ -204,6 +235,7 @@ impl ChannelState {
             device: DeviceStatus::Unknown,
             level_db: crate::mixer::LEVEL_FLOOR_DB,
             silent_blocks: 0,
+            dropouts: Dropouts::new(),
         }
     }
 
@@ -216,9 +248,126 @@ impl ChannelState {
     }
 }
 
+/// Audio a channel lost while recording: padding where the queue ran dry and
+/// overflow drops. Gaps are summed so that a burst of them gives one log
+/// entry. Samples the PipeWire thread could not hand over are kept apart:
+/// they mostly reappear as padding, so they name the cause rather than add
+/// to the total.
+#[derive(Debug)]
+struct Dropouts {
+    /// Samples lost since the last report.
+    samples: usize,
+    /// Separate gaps since the last report.
+    gaps: u32,
+    /// The last recorded block had a gap, which may go on.
+    in_gap: bool,
+    /// Samples the PipeWire thread dropped on a full PCM queue since the
+    /// last report.
+    queue_dropped: usize,
+    /// Recorded blocks since the last report.
+    blocks_since_report: u32,
+}
+
+impl Dropouts {
+    fn new() -> Self {
+        Self {
+            samples: 0,
+            gaps: 0,
+            in_gap: false,
+            queue_dropped: 0,
+            // The first gap is reported without waiting.
+            blocks_since_report: u32::MAX,
+        }
+    }
+
+    /// One recorded block with `lost` samples missing from it.
+    fn block(&mut self, lost: usize) {
+        self.blocks_since_report = self.blocks_since_report.saturating_add(1);
+        if lost == 0 {
+            self.in_gap = false;
+            return;
+        }
+        if !self.in_gap {
+            self.gaps = self.gaps.saturating_add(1);
+        }
+        self.in_gap = true;
+        self.samples = self.samples.saturating_add(lost);
+    }
+
+    /// Samples dropped before they reached the mixer.
+    fn dropped(&mut self, samples: usize) {
+        self.queue_dropped = self.queue_dropped.saturating_add(samples);
+    }
+
+    /// What to log: once the gap is over and the last report is
+    /// `DROPOUT_LOG_INTERVAL` old, or right now if `force`.
+    fn take(&mut self, force: bool) -> Option<DropoutReport> {
+        let due = !self.in_gap && self.blocks_since_report >= blocks_in(DROPOUT_LOG_INTERVAL);
+        if (self.gaps == 0 && self.queue_dropped == 0) || !(due || force) {
+            return None;
+        }
+        let report = DropoutReport {
+            gaps: self.gaps,
+            samples: self.samples,
+            queue_dropped: self.queue_dropped,
+        };
+        self.gaps = 0;
+        self.samples = 0;
+        self.queue_dropped = 0;
+        self.blocks_since_report = 0;
+        Some(report)
+    }
+}
+
+/// Lost audio of a channel since the last log entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DropoutReport {
+    gaps: u32,
+    samples: usize,
+    queue_dropped: usize,
+}
+
+impl DropoutReport {
+    /// Log text without the channel label.
+    fn text(self) -> String {
+        // Without a gap in the mixer the queue drop is all there is to say.
+        let mut text = match self.gaps {
+            0 => format!("пропуск звука {} мс", samples_to_ms(self.queue_dropped)),
+            1 => format!("пропуск звука {} мс", samples_to_ms(self.samples)),
+            gaps => format!(
+                "пропуски звука ({gaps}), всего {} мс",
+                samples_to_ms(self.samples)
+            ),
+        };
+        if self.queue_dropped > 0 {
+            text.push_str(" (поток записи не успевал)");
+        }
+        text
+    }
+}
+
+/// Samples missing from a block: padding and overflow drops. Drift
+/// correction is normal operation and is not counted.
+fn lost_samples(tick: &ChannelTick) -> usize {
+    tick.padded.saturating_add(tick.overflow)
+}
+
+/// Number of `TICK` blocks in `duration`.
+fn blocks_in(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis() / TICK.as_millis()).unwrap_or(u32::MAX)
+}
+
 /// Blocks in `SILENCE_DURATION`.
 fn silence_blocks() -> u32 {
-    u32::try_from(SILENCE_DURATION.as_millis() / TICK.as_millis()).unwrap_or(u32::MAX)
+    blocks_in(SILENCE_DURATION)
+}
+
+/// Duration of `samples` mono samples at `SAMPLE_RATE`, milliseconds.
+fn samples_to_ms(samples: usize) -> u64 {
+    u64::try_from(samples)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1000)
+        / u64::from(SAMPLE_RATE)
 }
 
 #[derive(Debug)]
@@ -291,11 +440,18 @@ impl<S: Storage> App<S> {
                 self.discarding = true;
                 self.state = State::Saving;
             }
-            Command::Quit => {
+            Command::Quit(reason) => {
                 if self.recorder.is_some() {
                     // Not saved by the user: keep it, marked (spec 5.7).
                     self.interrupted = true;
                     self.state = State::Saving;
+                    self.log(
+                        now,
+                        Severity::Warning,
+                        format!("Выход ({reason}): запись сохраняется с пометкой «прервано»"),
+                    );
+                } else {
+                    self.log(now, Severity::Info, format!("Выход ({reason})"));
                 }
             }
             Command::SetTitle(title) => self.title = title,
@@ -324,11 +480,25 @@ impl<S: Storage> App<S> {
                 }
                 self.last_path = None;
                 self.last_duration = Duration::ZERO;
+                let path = display_path(&recorder.path_for(&self.title));
                 self.recorder = Some(recorder);
                 self.state = State::Recording;
                 self.write_error = None;
                 self.mic.silent_blocks = 0;
                 self.them.silent_blocks = 0;
+                self.mic.dropouts = Dropouts::new();
+                self.them.dropouts = Dropouts::new();
+                self.log(now, Severity::Info, format!("Запись начата: {path}"));
+                for channel in [Channel::Mic, Channel::Them] {
+                    if self.channel(channel).device == DeviceStatus::Missing {
+                        let label = channel_label(channel);
+                        self.log(
+                            now,
+                            Severity::Error,
+                            format!("{label}: нет устройства, пишется тишина"),
+                        );
+                    }
+                }
             }
             Err(e) => self.log(now, Severity::Error, format!("Запись не началась: {e}")),
         }
@@ -342,10 +512,12 @@ impl<S: Storage> App<S> {
             State::Recording => {
                 recorder.pause(now);
                 self.state = State::Paused;
+                self.log(now, Severity::Info, "Пауза".into());
             }
             State::Paused => {
                 recorder.resume(now);
                 self.state = State::Recording;
+                self.log(now, Severity::Info, "Запись продолжена".into());
             }
             State::Idle | State::Saving => {}
         }
@@ -364,6 +536,8 @@ impl<S: Storage> App<S> {
         let Some(recorder) = self.recorder.take() else {
             return;
         };
+        // Gaps still waiting for their log entry belong to this recording.
+        self.report_dropouts(now, true);
         if discarding {
             self.last_path = None;
             self.last_duration = Duration::ZERO;
@@ -386,7 +560,12 @@ impl<S: Storage> App<S> {
                     .map(|f| display_path(f))
                     .collect::<Vec<_>>()
                     .join(", ");
-                self.log(now, Severity::Info, format!("Сохранено: {files}"));
+                let duration = format_duration(self.last_duration);
+                self.log(
+                    now,
+                    Severity::Info,
+                    format!("Сохранено ({duration}): {files}"),
+                );
             }
             Err(e) => self.log(now, Severity::Error, format!("Ошибка сохранения: {e}")),
         }
@@ -395,26 +574,54 @@ impl<S: Storage> App<S> {
     /// Takes one mixer block: levels always, audio only while recording.
     pub fn block(&mut self, block: &Block, now: DateTime<Local>) {
         let recording = self.state == State::Recording;
-        for (state, tick) in [(&mut self.mic, &block.mic), (&mut self.them, &block.them)] {
+        for (channel, tick) in [(Channel::Mic, &block.mic), (Channel::Them, &block.them)] {
+            let state = self.channel_mut(channel);
             state.level_db = tick.level_db;
-            if recording {
-                if tick.level_db < SILENCE_THRESHOLD_DB {
-                    state.silent_blocks = state.silent_blocks.saturating_add(1);
-                } else {
-                    state.silent_blocks = 0;
-                }
+            if !recording {
+                continue;
             }
+            let was_silent = state.silent_blocks >= silence_blocks();
+            if tick.level_db < SILENCE_THRESHOLD_DB {
+                state.silent_blocks = state.silent_blocks.saturating_add(1);
+            } else {
+                state.silent_blocks = 0;
+            }
+            let silent = state.silent_blocks >= silence_blocks();
+            let label = channel_label(channel);
+            if silent && !was_silent {
+                let secs = SILENCE_DURATION.as_secs();
+                self.log(
+                    now,
+                    Severity::Warning,
+                    format!("{label}: тишина дольше {secs} с"),
+                );
+            } else if was_silent && !silent {
+                self.log(now, Severity::Info, format!("{label}: звук появился"));
+            }
+            // A channel without a device records silence; that is logged as
+            // "нет устройства", not as lost audio.
+            let state = self.channel_mut(channel);
+            let lost = if matches!(state.device, DeviceStatus::Linked(_)) {
+                lost_samples(tick)
+            } else {
+                0
+            };
+            state.dropouts.block(lost);
         }
         if !recording {
             return;
         }
+        self.report_dropouts(now, false);
         let Some(recorder) = self.recorder.as_mut() else {
             return;
         };
-        match recorder.write_block(&block.stereo) {
-            Ok(WriteOutcome::Written | WriteOutcome::Skipped) => self.write_error = None,
+        let outcome = recorder.write_block(&block.stereo);
+        if outcome.is_ok() && self.write_error.take().is_some() {
+            self.log(now, Severity::Info, "Запись снова идёт".into());
+        }
+        match outcome {
+            Ok(WriteOutcome::Written | WriteOutcome::Skipped) => {}
             Ok(WriteOutcome::Restarted { saved, cause }) => {
-                self.write_error = None;
                 self.log(
                     now,
                     Severity::Warning,
@@ -455,14 +662,45 @@ impl<S: Storage> App<S> {
             // The stream follows the default; its actual device is what is
             // shown and logged (StreamDevice).
             PwEvent::DefaultChanged { .. } => {}
+            PwEvent::PcmDropped { channel, samples } => {
+                if self.state == State::Recording {
+                    self.channel_mut(channel).dropouts.dropped(samples);
+                }
+            }
+        }
+    }
+
+    /// Logs lost audio of both channels that is due (see [`Dropouts::take`]).
+    fn report_dropouts(&mut self, now: DateTime<Local>, force: bool) {
+        for channel in [Channel::Mic, Channel::Them] {
+            let Some(report) = self.channel_mut(channel).dropouts.take(force) else {
+                continue;
+            };
+            let label = channel_label(channel);
+            self.log(
+                now,
+                Severity::Warning,
+                format!("{label}: {}", report.text()),
+            );
+        }
+    }
+
+    fn channel(&self, channel: Channel) -> &ChannelState {
+        match channel {
+            Channel::Mic => &self.mic,
+            Channel::Them => &self.them,
+        }
+    }
+
+    fn channel_mut(&mut self, channel: Channel) -> &mut ChannelState {
+        match channel {
+            Channel::Mic => &mut self.mic,
+            Channel::Them => &mut self.them,
         }
     }
 
     fn stream_device(&mut self, channel: Channel, device: Option<Device>, now: DateTime<Local>) {
-        let state = match channel {
-            Channel::Mic => &mut self.mic,
-            Channel::Them => &mut self.them,
-        };
+        let state = self.channel_mut(channel);
         let new = device.map_or(DeviceStatus::Missing, DeviceStatus::Linked);
         if state.device == new {
             return;
@@ -531,7 +769,7 @@ pub fn allows(state: State, command: &Command) -> bool {
         Command::TogglePause | Command::Pause | Command::Save | Command::Discard => {
             matches!(state, State::Recording | State::Paused)
         }
-        Command::Quit | Command::SetTitle(_) => true,
+        Command::Quit(_) | Command::SetTitle(_) => true,
     }
 }
 
@@ -541,6 +779,13 @@ pub fn channel_label(channel: Channel) -> &'static str {
         Channel::Mic => "Микрофон",
         Channel::Them => "Собеседники",
     }
+}
+
+/// `HH:MM:SS`.
+#[must_use]
+pub fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
 /// Path with `$HOME` shown as `~`.
@@ -593,8 +838,8 @@ pub fn run<S: Storage>(
                 Err(_) => events = crossbeam_channel::never(),
             },
             recv(commands) -> command => {
-                let command = command.unwrap_or(Command::Quit);
-                let quit = command == Command::Quit;
+                let command = command.unwrap_or(Command::Quit(QuitReason::UiGone));
+                let quit = matches!(command, Command::Quit(_));
                 app.command(command, Local::now());
                 if app.state() == State::Saving {
                     publish(app);
@@ -608,13 +853,32 @@ pub fn run<S: Storage>(
             },
             recv(crossbeam_channel::at(deadline)) -> _ => {},
         }
-        for _ in 0..clock.take_due(Instant::now()) {
-            app.block(&mixer.tick(), Local::now());
+        let due = clock.take_due(Instant::now());
+        if due > 0 {
+            run_ticks(app, &mut mixer, &pcm, due);
             changed = true;
         }
         if changed {
             publish(app);
         }
+    }
+}
+
+/// Runs `due` mixer ticks. Before each tick, chunks already waiting in `pcm`
+/// are pushed until a queue holds a block plus reserve. After this thread
+/// stalls (e.g. on a slow write), the backlog is thus replayed tick by tick:
+/// pushing all of it first would overflow the queues, and ticking first would
+/// pad blocks with silence while the audio for them is still in `pcm`.
+fn run_ticks<S: Storage>(app: &mut App<S>, mixer: &mut Mixer, pcm: &Receiver<PcmChunk>, due: u64) {
+    for _ in 0..due {
+        while mixer.wants_samples() {
+            // Empty or disconnected: tick with what there is.
+            let Ok(chunk) = pcm.try_recv() else {
+                break;
+            };
+            mixer.push(chunk.channel, chunk.samples());
+        }
+        app.block(&mixer.tick(), Local::now());
     }
 }
 
@@ -830,7 +1094,15 @@ mod tests {
             snapshot.path,
             Some(PathBuf::from("/calls/2026-10-21_14-00.flac"))
         );
-        assert_eq!(texts(&app), ["Сохранено: /calls/2026-10-21_14-00.flac"]);
+        assert_eq!(
+            texts(&app),
+            [
+                "Запись начата: /calls/2026-10-21_14-00.flac",
+                "Пауза",
+                "Запись продолжена",
+                "Сохранено (00:00:00): /calls/2026-10-21_14-00.flac",
+            ]
+        );
     }
 
     #[test]
@@ -851,7 +1123,13 @@ mod tests {
         let snapshot = app.snapshot();
         assert_eq!(snapshot.path, None);
         assert_eq!(snapshot.duration, Duration::ZERO);
-        assert_eq!(texts(&app), ["Запись удалена"]);
+        assert_eq!(
+            texts(&app),
+            [
+                "Запись начата: /calls/2026-10-21_14-00.flac",
+                "Запись удалена"
+            ]
+        );
 
         // The next stop saves again.
         app.command(Command::Start, at(3));
@@ -933,7 +1211,13 @@ mod tests {
         fake.borrow_mut().space = Some(false);
         app.command(Command::Start, at(0));
         assert_eq!(app.state(), State::Recording);
-        assert_eq!(texts(&app), ["Мало места: свободно меньше 1 ГБ"]);
+        assert_eq!(
+            texts(&app),
+            [
+                "Мало места: свободно меньше 1 ГБ",
+                "Запись начата: /calls/2026-10-21_14-00.flac",
+            ]
+        );
     }
 
     #[test]
@@ -946,7 +1230,10 @@ mod tests {
         assert_eq!(app.state(), State::Idle);
         assert_eq!(
             texts(&app),
-            ["Ошибка сохранения: не удалось запустить flac: тест"]
+            [
+                "Запись начата: /calls/2026-10-21_14-00.flac",
+                "Ошибка сохранения: не удалось запустить flac: тест",
+            ]
         );
         let entry = app.snapshot().log.pop().unwrap();
         assert_eq!(entry.severity, Severity::Error);
@@ -957,7 +1244,7 @@ mod tests {
         let (mut app, fake) = app();
         app.command(Command::Start, at(0));
         app.command(Command::TogglePause, at(1));
-        app.command(Command::Quit, at(2));
+        app.command(Command::Quit(QuitReason::User), at(2));
         assert_eq!(app.state(), State::Saving);
         app.finish_saving(at(2));
         assert_eq!(calls(&fake).last(), Some(&Call::Stop(String::new(), true)));
@@ -978,9 +1265,230 @@ mod tests {
     #[test]
     fn quit_while_idle_does_nothing() {
         let (mut app, fake) = app();
-        app.command(Command::Quit, at(0));
+        app.command(Command::Quit(QuitReason::User), at(0));
         assert_eq!(app.state(), State::Idle);
         assert_eq!(calls(&fake), vec![]);
+        assert_eq!(texts(&app), ["Выход (по команде пользователя)"]);
+    }
+
+    #[test]
+    fn quit_reason_is_logged() {
+        let reasons = [
+            (QuitReason::User, "по команде пользователя"),
+            (QuitReason::CtrlC, "по Ctrl+C"),
+            (QuitReason::Signal("SIGTERM"), "по сигналу SIGTERM"),
+            (QuitReason::TerminalLost, "терминал недоступен"),
+            (QuitReason::UiGone, "интерфейс завершился"),
+        ];
+        for (reason, text) in reasons {
+            let (mut app, _fake) = app();
+            app.command(Command::Start, at(0));
+            app.command(Command::Quit(reason), at(1));
+            let log = app.snapshot().log;
+            let entry = log.last().unwrap();
+            assert_eq!(
+                entry.text,
+                format!("Выход ({text}): запись сохраняется с пометкой «прервано»")
+            );
+            assert_eq!(entry.severity, Severity::Warning);
+        }
+    }
+
+    /// App with both channels linked to a device, recording.
+    fn recording_with_devices() -> (App<FakeStorage>, Rc<RefCell<Fake>>) {
+        let (mut app, fake) = app();
+        for channel in [Channel::Mic, Channel::Them] {
+            app.pw_event(
+                PwEvent::StreamDevice {
+                    channel,
+                    device: device("a", "A"),
+                },
+                at(0),
+            );
+        }
+        app.command(Command::Start, at(0));
+        app.log.clear();
+        (app, fake)
+    }
+
+    /// A block whose mic channel is missing `lost` samples.
+    fn mic_gap(padded: usize, overflow: usize) -> Block {
+        let mut b = block(-20.0, -20.0);
+        b.mic.padded = padded;
+        b.mic.overflow = overflow;
+        b
+    }
+
+    #[test]
+    fn dropout_is_logged_when_gap_ends() {
+        let (mut app, _fake) = recording_with_devices();
+        app.block(&mic_gap(BLOCK_SAMPLES, 0), at(1));
+        app.block(&mic_gap(800, 0), at(1));
+        // The gap is still going on.
+        assert_eq!(texts(&app), Vec::<String>::new());
+        app.block(&block(-20.0, -20.0), at(1));
+        assert_eq!(texts(&app), ["Микрофон: пропуск звука 150 мс"]);
+        assert_eq!(app.snapshot().log[0].severity, Severity::Warning);
+        // Drift correction alone is not a gap.
+        let mut drift = block(-20.0, -20.0);
+        drift.mic.dropped = 320;
+        drift.mic.inserted = 320;
+        for _ in 0..blocks_in(DROPOUT_LOG_INTERVAL) {
+            app.block(&drift, at(2));
+        }
+        assert_eq!(texts(&app).len(), 1);
+    }
+
+    #[test]
+    fn dropouts_are_summed_between_reports() {
+        let (mut app, _fake) = recording_with_devices();
+        app.block(&mic_gap(1600, 0), at(1));
+        app.block(&block(-20.0, -20.0), at(1));
+        // Within the interval: collected, not logged.
+        app.block(&mic_gap(0, 800), at(2));
+        app.block(&block(-20.0, -20.0), at(2));
+        app.block(&mic_gap(400, 0), at(2));
+        app.block(&block(-20.0, -20.0), at(2));
+        assert_eq!(texts(&app), ["Микрофон: пропуск звука 100 мс"]);
+        for _ in 0..blocks_in(DROPOUT_LOG_INTERVAL) {
+            app.block(&block(-20.0, -20.0), at(3));
+        }
+        assert_eq!(
+            texts(&app),
+            [
+                "Микрофон: пропуск звука 100 мс",
+                "Микрофон: пропуски звука (2), всего 75 мс",
+            ]
+        );
+    }
+
+    #[test]
+    fn pcm_queue_drops_name_the_cause_and_are_not_added() {
+        let (mut app, _fake) = recording_with_devices();
+        let dropped = |samples| PwEvent::PcmDropped {
+            channel: Channel::Them,
+            samples,
+        };
+        // The dropped samples show up in the mixer as padding.
+        app.pw_event(dropped(3200), at(1));
+        let mut gap = block(-20.0, -20.0);
+        gap.them.padded = 3200;
+        app.block(&gap, at(1));
+        app.block(&block(-20.0, -20.0), at(1));
+        // A drop the drift correction absorbed: no gap, still reported.
+        app.pw_event(dropped(320), at(2));
+        for _ in 0..blocks_in(DROPOUT_LOG_INTERVAL) {
+            app.block(&block(-20.0, -20.0), at(3));
+        }
+        assert_eq!(
+            texts(&app),
+            [
+                "Собеседники: пропуск звука 200 мс (поток записи не успевал)",
+                "Собеседники: пропуск звука 20 мс (поток записи не успевал)",
+            ]
+        );
+    }
+
+    /// Interleaved chunks of both channels, `samples` per channel, as the
+    /// PipeWire thread sends them (small buffers, both streams running).
+    fn backlog(samples: usize) -> Receiver<PcmChunk> {
+        const PIECE: usize = 341;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut sent = 0;
+        while sent < samples {
+            let len = PIECE.min(samples - sent);
+            for channel in [Channel::Mic, Channel::Them] {
+                tx.send(PcmChunk::new(channel, &vec![1000; len])).unwrap();
+            }
+            sent += len;
+        }
+        rx
+    }
+
+    #[test]
+    fn backlog_after_stall_is_replayed_without_gaps() {
+        use crate::mixer::TARGET_LEVEL;
+        let (mut app, fake) = recording_with_devices();
+        let mut mixer = Mixer::new();
+        // The thread stalled for 3 s while PipeWire kept sending: 30 ticks
+        // are due and their audio waits in the channel, plus the usual
+        // block and reserve.
+        let ticks = 30;
+        let pcm = backlog(TARGET_LEVEL + ticks * BLOCK_SAMPLES);
+        run_ticks(&mut app, &mut mixer, &pcm, ticks as u64);
+
+        assert_eq!(fake.borrow().blocks, 30);
+        assert_eq!(texts(&app), Vec::<String>::new());
+        // Real audio, not padding: 1000 / 32768 is about -30 dBFS.
+        assert!(app.snapshot().mic.level_db > -31.0);
+        assert!(app.snapshot().them.level_db > -31.0);
+        // What is left is the usual latency (a block plus reserve), in the
+        // channel or the queue: nothing was dropped or padded.
+        let left: usize = pcm
+            .try_iter()
+            .filter(|c| c.channel == Channel::Mic)
+            .map(|c| c.samples().len())
+            .sum();
+        assert_eq!(left + mixer.queued(Channel::Mic), TARGET_LEVEL);
+    }
+
+    #[test]
+    fn ticks_without_audio_are_padded() {
+        let (mut app, fake) = recording_with_devices();
+        let mut mixer = Mixer::new();
+        let (_tx, pcm) = crossbeam_channel::unbounded();
+        run_ticks(&mut app, &mut mixer, &pcm, 3);
+        assert_eq!(fake.borrow().blocks, 3);
+        app.block(&block(-20.0, -20.0), at(1));
+        assert_eq!(
+            texts(&app),
+            [
+                "Микрофон: пропуск звука 300 мс",
+                "Собеседники: пропуск звука 300 мс"
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_dropouts_are_logged_on_save() {
+        let (mut app, _fake) = recording_with_devices();
+        app.block(&mic_gap(1600, 0), at(1));
+        app.command(Command::Save, at(2));
+        app.finish_saving(at(2));
+        let texts = texts(&app);
+        assert_eq!(texts[0], "Микрофон: пропуск звука 100 мс");
+        assert!(texts[1].starts_with("Сохранено"), "{texts:?}");
+    }
+
+    #[test]
+    fn gaps_without_device_or_recording_are_not_dropouts() {
+        let (mut app, _fake) = app();
+        // Unknown device: the channel records silence by design.
+        app.command(Command::Start, at(0));
+        app.block(&mic_gap(BLOCK_SAMPLES, 0), at(1));
+        app.block(&block(-20.0, -20.0), at(1));
+        app.command(Command::TogglePause, at(2));
+        app.log.clear();
+
+        // Paused: neither mixer gaps nor PipeWire drops count.
+        app.pw_event(
+            PwEvent::StreamDevice {
+                channel: Channel::Mic,
+                device: device("a", "A"),
+            },
+            at(2),
+        );
+        app.block(&mic_gap(BLOCK_SAMPLES, 0), at(3));
+        app.pw_event(
+            PwEvent::PcmDropped {
+                channel: Channel::Mic,
+                samples: 1600,
+            },
+            at(3),
+        );
+        app.command(Command::TogglePause, at(4));
+        app.block(&block(-20.0, -20.0), at(4));
+        assert_eq!(texts(&app), ["Запись продолжена"]);
     }
 
     #[test]
@@ -1001,7 +1509,10 @@ mod tests {
         );
         assert_eq!(
             texts(&app),
-            ["Микрофон: Встроенный микрофон → Jabra Evolve2 65 Mono"]
+            [
+                "Запись начата: /calls/2026-10-21_14-00.flac",
+                "Микрофон: Встроенный микрофон → Jabra Evolve2 65 Mono",
+            ]
         );
         assert_eq!(
             calls(&fake),
@@ -1082,6 +1593,65 @@ mod tests {
 
         app.block(&block(-30.0, -20.0), at(63));
         assert!(!app.snapshot().mic.silent);
+
+        // Entering and leaving silence is logged once each; the pause in
+        // between does not repeat it.
+        assert_eq!(
+            texts(&app),
+            [
+                "Запись начата: /calls/2026-10-21_14-00.flac",
+                "Микрофон: тишина дольше 60 с",
+                "Пауза",
+                "Запись продолжена",
+                "Микрофон: звук появился",
+            ]
+        );
+        assert_eq!(app.snapshot().log[1].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn start_without_device_is_logged() {
+        let (mut app, _fake) = app();
+        app.pw_event(
+            PwEvent::StreamDevice {
+                channel: Channel::Mic,
+                device: device("a", "A"),
+            },
+            at(0),
+        );
+        app.pw_event(
+            PwEvent::StreamDevice {
+                channel: Channel::Mic,
+                device: None,
+            },
+            at(1),
+        );
+        // Unknown (nothing reported yet) is not "missing".
+        app.command(Command::Start, at(2));
+        assert_eq!(
+            texts(&app),
+            [
+                "Микрофон: нет устройства",
+                "Запись начата: /calls/2026-10-21_14-00.flac",
+                "Микрофон: нет устройства, пишется тишина",
+            ]
+        );
+        assert_eq!(app.snapshot().log[2].severity, Severity::Error);
+    }
+
+    #[test]
+    fn save_reports_duration() {
+        let (mut app, _fake) = app();
+        app.command(Command::Start, at(0));
+        for _ in 0..25 {
+            app.block(&block(-20.0, -20.0), at(1));
+        }
+        app.command(Command::Save, at(3));
+        app.finish_saving(at(3));
+        assert_eq!(
+            texts(&app).last().map(String::as_str),
+            Some("Сохранено (00:00:02): /calls/2026-10-21_14-00.flac")
+        );
     }
 
     #[test]
@@ -1101,16 +1671,26 @@ mod tests {
         for _ in 0..10 {
             app.block(&block(-20.0, -20.0), at(1));
         }
+        let error = "Ошибка записи: не удалось запустить flac: тест";
         assert_eq!(
             texts(&app),
-            ["Ошибка записи: не удалось запустить flac: тест"]
+            ["Запись начата: /calls/2026-10-21_14-00.flac", error]
         );
-        // Recovered, then failed again: logged again.
+        // Recovered, then failed again: both logged.
         fake.borrow_mut().fail_write = false;
+        app.block(&block(-20.0, -20.0), at(2));
         app.block(&block(-20.0, -20.0), at(2));
         fake.borrow_mut().fail_write = true;
         app.block(&block(-20.0, -20.0), at(3));
-        assert_eq!(texts(&app).len(), 2);
+        assert_eq!(
+            texts(&app),
+            [
+                "Запись начата: /calls/2026-10-21_14-00.flac",
+                error,
+                "Запись снова идёт",
+                error,
+            ]
+        );
     }
 
     #[test]
@@ -1122,7 +1702,10 @@ mod tests {
         assert_eq!(app.state(), State::Recording);
         assert_eq!(
             texts(&app),
-            ["flac перезапущен (сбой), сохранено: /calls/x-part1.flac"]
+            [
+                "Запись начата: /calls/2026-10-21_14-00.flac",
+                "flac перезапущен (сбой), сохранено: /calls/x-part1.flac",
+            ]
         );
     }
 
@@ -1175,7 +1758,9 @@ mod tests {
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
         let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded();
         command_tx.send(Command::Start).unwrap();
-        command_tx.send(Command::Quit).unwrap();
+        command_tx
+            .send(Command::Quit(QuitReason::Signal("SIGTERM")))
+            .unwrap();
         run(&mut app, pcm_rx, event_rx, &command_rx, &snapshot_tx);
 
         let states: Vec<State> = snapshot_rx.try_iter().map(|s| s.state).collect();

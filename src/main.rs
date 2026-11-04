@@ -13,7 +13,7 @@ use std::fs::{self, File, TryLockError};
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,13 +31,20 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{App, Command, DiskStorage, LogEntry, Severity};
+use crate::app::{App, Command, DiskStorage, LogEntry, QuitReason, Severity};
 use crate::ui::{RecoveryChoice, Ui, UiAction};
 
 /// UI refresh interval (spec 5.1).
 const FRAME: Duration = Duration::from_millis(50);
 /// Lock file that keeps a second instance from touching our `.flac.part`.
 const LOCK_FILE: &str = ".callrec.lock";
+/// Signals that save and exit (spec 6.7), with their names for the log.
+/// The index + 1 is stored in the quit flag; 0 means no signal.
+const QUIT_SIGNALS: [(i32, &str); 3] = [
+    (signal_hook::consts::SIGTERM, "SIGTERM"),
+    (signal_hook::consts::SIGINT, "SIGINT"),
+    (signal_hook::consts::SIGHUP, "SIGHUP"),
+];
 /// Whether keyboard enhancement flags were pushed and must be popped.
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
@@ -49,13 +56,9 @@ fn main() -> anyhow::Result<()> {
     let _lock = lock_instance(&dir)?;
 
     // SIGTERM, SIGINT and SIGHUP save and exit without asking (spec 6.7).
-    let quit_signal = Arc::new(AtomicBool::new(false));
-    for signal in [
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGHUP,
-    ] {
-        signal_hook::flag::register(signal, Arc::clone(&quit_signal))
+    let quit_signal = Arc::new(AtomicUsize::new(0));
+    for (index, (signal, _)) in QUIT_SIGNALS.iter().enumerate() {
+        signal_hook::flag::register_usize(*signal, Arc::clone(&quit_signal), index + 1)
             .context("обработчик сигналов")?;
     }
 
@@ -90,7 +93,7 @@ fn main() -> anyhow::Result<()> {
 fn run_session(
     terminal: &mut Term,
     mut app: App<DiskStorage>,
-    quit_signal: &AtomicBool,
+    quit_signal: &AtomicUsize,
 ) -> anyhow::Result<Vec<LogEntry>> {
     let (pcm_tx, pcm_rx) = crossbeam_channel::bounded(pw::PCM_QUEUE_CHUNKS);
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -110,10 +113,10 @@ fn run_session(
     let mut terminal_ok = true;
     let mut quitting = false;
     // Asks the recorder thread to save and exit; the loop then waits for it.
-    let quit = |quitting: &mut bool| {
+    let quit = |quitting: &mut bool, reason: QuitReason| {
         if !*quitting {
             *quitting = true;
-            let _ = command_tx.send(Command::Quit);
+            let _ = command_tx.send(Command::Quit(reason));
         }
     };
 
@@ -122,16 +125,16 @@ fn run_session(
         // going without drawing until the recorder has saved.
         if terminal_ok && terminal.draw(|frame| ui.draw(frame)).is_err() {
             terminal_ok = false;
-            quit(&mut quitting);
+            quit(&mut quitting, QuitReason::TerminalLost);
         }
-        if quit_signal.load(Ordering::Relaxed) {
-            quit(&mut quitting);
+        if let Some(name) = received_signal(quit_signal) {
+            quit(&mut quitting, QuitReason::Signal(name));
         }
 
         let action = if terminal_ok {
             read_event(&mut ui).unwrap_or_else(|_| {
                 terminal_ok = false;
-                quit(&mut quitting);
+                quit(&mut quitting, QuitReason::TerminalLost);
                 None
             })
         } else {
@@ -142,7 +145,7 @@ fn run_session(
             Some(UiAction::Command(command)) => {
                 let _ = command_tx.send(command);
             }
-            Some(UiAction::Quit) => quit(&mut quitting),
+            Some(UiAction::Quit(reason)) => quit(&mut quitting, reason),
             None => {}
         }
 
@@ -177,6 +180,13 @@ fn run_session(
     Ok(log)
 }
 
+/// Name of the quit signal received so far, if any.
+fn received_signal(flag: &AtomicUsize) -> Option<&'static str> {
+    let index = flag.load(Ordering::Relaxed).checked_sub(1)?;
+    // An unknown value still means a signal arrived.
+    Some(QUIT_SIGNALS.get(index).map_or("?", |(_, name)| *name))
+}
+
 /// Waits up to one frame for input and turns it into an action.
 fn read_event(ui: &mut Ui) -> io::Result<Option<UiAction>> {
     if !event::poll(FRAME)? {
@@ -195,11 +205,11 @@ fn recovery_dialog(
     terminal: &mut Term,
     files: &[PathBuf],
     app: &mut App<DiskStorage>,
-    quit_signal: &AtomicBool,
+    quit_signal: &AtomicUsize,
 ) -> anyhow::Result<bool> {
     let choice = loop {
         terminal.draw(|frame| ui::draw_recovery(frame, files, None))?;
-        if quit_signal.load(Ordering::Relaxed) {
+        if received_signal(quit_signal).is_some() {
             break RecoveryChoice::Quit;
         }
         if event::poll(FRAME)?

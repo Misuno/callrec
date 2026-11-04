@@ -15,6 +15,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -68,6 +70,20 @@ impl PcmChunk {
     pub fn samples(&self) -> &[i16] {
         self.samples.get(..self.len).unwrap_or(&[])
     }
+
+    /// A chunk with `samples` (at most `CHUNK_SAMPLES`), for tests.
+    #[cfg(test)]
+    pub fn new(channel: Channel, samples: &[i16]) -> Self {
+        let mut chunk = Self {
+            channel,
+            len: samples.len().min(CHUNK_SAMPLES),
+            samples: [0; CHUNK_SAMPLES],
+        };
+        for (to, from) in chunk.samples.iter_mut().zip(samples) {
+            *to = *from;
+        }
+        chunk
+    }
 }
 
 impl std::fmt::Debug for PcmChunk {
@@ -100,6 +116,9 @@ pub enum PwEvent {
         channel: Channel,
         device: Option<Device>,
     },
+    /// The realtime callback dropped `samples` captured samples because the
+    /// PCM queue was full (the recorder thread fell behind).
+    PcmDropped { channel: Channel, samples: usize },
     /// The safety net re-connected a stream that WirePlumber did not move.
     ManualReconnect { channel: Channel },
     /// Connected to PipeWire (again).
@@ -434,6 +453,13 @@ impl Session {
         for event in changes {
             let _ = events.send(event);
         }
+        for capture in [&self.mic, &self.them] {
+            let samples = capture.dropped.swap(0, Ordering::Relaxed);
+            if samples > 0 {
+                let channel = capture.channel;
+                let _ = events.send(PwEvent::PcmDropped { channel, samples });
+            }
+        }
         for channel in reconnects {
             let capture = match channel {
                 Channel::Mic => &self.mic,
@@ -494,6 +520,9 @@ fn parse_default(value: &str) -> Option<String> {
 struct Capture {
     channel: Channel,
     stream: StreamRc,
+    /// Samples the realtime callback dropped since the last housekeeping
+    /// pass. An atomic, so the callback neither locks nor allocates.
+    dropped: Arc<AtomicUsize>,
     _listener: StreamListener<()>,
     format: Vec<u8>,
 }
@@ -524,6 +553,8 @@ impl Capture {
         let stream = StreamRc::new(core.clone(), name, props)?;
 
         let pcm = pcm.clone();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let process_dropped = Arc::clone(&dropped);
         let events = events.clone();
         let listener = stream
             .add_local_listener_with_user_data(())
@@ -532,12 +563,13 @@ impl Capture {
                     let _ = events.send(PwEvent::Error(format!("поток {name}: {message}")));
                 }
             })
-            .process(move |stream, ()| process(stream, channel, &pcm))
+            .process(move |stream, ()| process(stream, channel, &pcm, &process_dropped))
             .register()?;
 
         let capture = Self {
             channel,
             stream,
+            dropped,
             _listener: listener,
             format: format_param()?,
         };
@@ -576,7 +608,7 @@ impl Capture {
 
 /// Realtime callback: copies samples into fixed-size chunks and hands them
 /// over without blocking. No allocation, no locks, no logging here.
-fn process(stream: &Stream, channel: Channel, pcm: &Sender<PcmChunk>) {
+fn process(stream: &Stream, channel: Channel, pcm: &Sender<PcmChunk>, dropped: &AtomicUsize) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
@@ -601,8 +633,11 @@ fn process(stream: &Stream, channel: Channel, pcm: &Sender<PcmChunk>) {
             *sample = i16::from_le_bytes(*le);
         }
         // A full queue means the writer thread is behind. Dropping is the only
-        // option here; the mixer pads the gap with silence.
-        let _ = pcm.try_send(chunk);
+        // option here; the mixer pads the gap with silence. The count is
+        // reported by the housekeeping pass.
+        if pcm.try_send(chunk).is_err() {
+            dropped.fetch_add(piece.len(), Ordering::Relaxed);
+        }
     }
 }
 

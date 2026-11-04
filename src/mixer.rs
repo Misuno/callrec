@@ -45,6 +45,9 @@ pub struct ChannelTick {
     pub padded: usize,
     /// Captured samples discarded by overflow or drift correction.
     pub dropped: usize,
+    /// Part of `dropped` discarded because the queue exceeded `MAX_LEVEL`
+    /// (a burst or a stalled consumer), as opposed to drift correction.
+    pub overflow: usize,
     /// Zeros inserted into the queue by drift correction.
     pub inserted: usize,
 }
@@ -86,9 +89,25 @@ impl Mixer {
 
     /// Appends captured samples to a channel queue.
     pub fn push(&mut self, channel: Channel, samples: &[i16]) {
-        self.queue_mut(channel)
-            .samples
-            .extend(samples.iter().copied());
+        let queue = self.queue_mut(channel);
+        queue.samples.extend(samples.iter().copied());
+        queue.fed = true;
+    }
+
+    /// Whether more waiting audio should be pushed before the next tick.
+    /// Used to replay a backlog tick by tick: pushing it all at once would
+    /// overflow. True while a channel that received audio since the last tick
+    /// is below `TARGET_LEVEL` (or nothing was received yet), and no queue is
+    /// at `MAX_LEVEL`. A channel that receives nothing (no device) does not
+    /// hold the other one back.
+    #[must_use]
+    pub fn wants_samples(&self) -> bool {
+        let (mic, them) = (&self.mic, &self.them);
+        if mic.samples.len() >= MAX_LEVEL || them.samples.len() >= MAX_LEVEL {
+            return false;
+        }
+        let low = |q: &ChannelQueue| q.fed && q.samples.len() < TARGET_LEVEL;
+        low(mic) || low(them) || (!mic.fed && !them.fed)
     }
 
     /// Number of samples currently queued for a channel.
@@ -126,6 +145,8 @@ struct ChannelQueue {
     /// False while the queue fills up to `TARGET_LEVEL` (at start and after
     /// an underrun); the channel outputs silence meanwhile.
     primed: bool,
+    /// Audio was pushed since the last tick.
+    fed: bool,
     window_ticks: u32,
     window_min: usize,
     window_max: usize,
@@ -136,6 +157,7 @@ impl ChannelQueue {
         Self {
             samples: VecDeque::with_capacity(MAX_LEVEL + BLOCK_SAMPLES),
             primed: false,
+            fed: false,
             window_ticks: 0,
             window_min: usize::MAX,
             window_max: 0,
@@ -144,6 +166,7 @@ impl ChannelQueue {
 
     /// Writes exactly `BLOCK_SAMPLES` samples into `out`.
     fn tick(&mut self, out: &mut Vec<i16>) -> ChannelTick {
+        self.fed = false;
         let mut tick = ChannelTick::default();
         out.clear();
         self.fill_block(out, &mut tick);
@@ -164,7 +187,9 @@ impl ChannelQueue {
 
         let level = self.samples.len();
         if level > MAX_LEVEL {
-            tick.dropped += self.drop_oldest(level.saturating_sub(TARGET_LEVEL));
+            let overflow = self.drop_oldest(level.saturating_sub(TARGET_LEVEL));
+            tick.dropped += overflow;
+            tick.overflow = overflow;
             self.reset_window();
         } else {
             self.window_ticks = self.window_ticks.saturating_add(1);
@@ -438,9 +463,35 @@ mod tests {
         assert!(level > MAX_LEVEL);
         let block = mixer.tick();
         assert_eq!(block.mic.dropped, level - TARGET_LEVEL);
+        assert_eq!(block.mic.overflow, level - TARGET_LEVEL);
         let first_kept = BLOCK_SAMPLES + level - TARGET_LEVEL;
         assert_eq!(left(&block), counter(first_kept, BLOCK_SAMPLES));
         assert_eq!(mixer.queued(Channel::Mic), RESERVE_SAMPLES);
+    }
+
+    #[test]
+    fn wants_samples_until_fed_channels_reach_target() {
+        let mut mixer = Mixer::new();
+        // Nothing received yet: pull.
+        assert!(mixer.wants_samples());
+        // Only the mic gets audio (no output device): it alone decides.
+        mixer.push(Channel::Mic, &[1; TARGET_LEVEL - 1]);
+        assert!(mixer.wants_samples());
+        mixer.push(Channel::Mic, &[1; 1]);
+        assert!(!mixer.wants_samples());
+        // The other channel is fed but behind: keep pulling.
+        mixer.push(Channel::Them, &[1; 100]);
+        assert!(mixer.wants_samples());
+        mixer.push(Channel::Them, &[1; TARGET_LEVEL]);
+        assert!(!mixer.wants_samples());
+
+        // A tick clears "fed"; a queue at MAX_LEVEL stops pulling anyway.
+        let mut mixer = Mixer::new();
+        mixer.push(Channel::Them, &[1; 10]);
+        mixer.push(Channel::Mic, &[1; MAX_LEVEL]);
+        assert!(!mixer.wants_samples());
+        mixer.tick();
+        assert!(mixer.wants_samples());
     }
 
     #[test]
@@ -449,6 +500,7 @@ mod tests {
         mixer.push(Channel::Mic, &[1; MAX_LEVEL]);
         let block = mixer.tick();
         assert_eq!(block.mic.dropped, 0);
+        assert_eq!(block.mic.overflow, 0);
         assert_eq!(mixer.queued(Channel::Mic), MAX_LEVEL - BLOCK_SAMPLES);
     }
 
@@ -466,6 +518,7 @@ mod tests {
             mic.push(&mut mixer, per_tick);
             let block = mixer.tick();
             assert_eq!(block.mic.padded, 0);
+            assert_eq!(block.mic.overflow, 0);
             assert!(mixer.queued(Channel::Mic).abs_diff(RESERVE_SAMPLES) <= bound);
             dropped += block.mic.dropped;
             inserted += block.mic.inserted;
@@ -475,6 +528,7 @@ mod tests {
 
     #[test]
     fn fast_device_clock_is_trimmed() {
+        // Drift correction is not overflow (checked in run_drifting_channel).
         let (dropped, inserted) = run_drifting_channel(BLOCK_SAMPLES + 8);
         assert!(dropped > 0);
         assert_eq!(inserted, 0);

@@ -110,6 +110,52 @@ pub struct DeviceChange {
     pub description: String,
 }
 
+/// Who speaks in the recording: the user on the left channel, the speakers
+/// on the right one (spec 5.7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Participants {
+    pub me: String,
+    pub them: Vec<String>,
+}
+
+impl Participants {
+    /// `me` and `them` as typed; `them` is a comma-separated list of names.
+    #[must_use]
+    pub fn parse(me: &str, them: &str) -> Self {
+        Self {
+            me: me.trim().to_owned(),
+            them: speaker_names(them),
+        }
+    }
+}
+
+/// Names from a comma-separated list, trimmed, without empty ones.
+#[must_use]
+pub fn speaker_names(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+struct MetadataParticipants<'a> {
+    me: MetadataMe<'a>,
+    them: MetadataThem<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetadataMe<'a> {
+    name: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct MetadataThem<'a> {
+    num_speakers: usize,
+    names: &'a [String],
+}
+
 #[derive(Debug, Serialize)]
 struct Metadata<'a> {
     title: &'a str,
@@ -119,6 +165,7 @@ struct Metadata<'a> {
     finished_at: String,
     duration_sec: f64,
     channels: BTreeMap<&'static str, &'static str>,
+    participants: MetadataParticipants<'a>,
     files: Vec<String>,
     pauses: &'a [Pause],
     device_changes: &'a [DeviceChange],
@@ -304,6 +351,7 @@ impl Recording {
         mut self,
         finished_at: DateTime<Local>,
         title: &str,
+        participants: &Participants,
         interrupted: bool,
     ) -> Result<Saved, WriterError> {
         // Saved while paused: the audio ends where the pause began, and the
@@ -331,7 +379,7 @@ impl Recording {
                 }
             }
         }
-        let metadata = self.write_metadata(finished_at, title.trim(), interrupted);
+        let metadata = self.write_metadata(finished_at, title.trim(), participants, interrupted);
         match (failure, metadata) {
             (None, Ok(metadata)) => Ok(Saved {
                 files: self.files,
@@ -459,6 +507,7 @@ impl Recording {
         &self,
         finished_at: DateTime<Local>,
         title: &str,
+        participants: &Participants,
         interrupted: bool,
     ) -> Result<PathBuf, WriterError> {
         let path = self.dir.join(format!("{}.json", self.stem));
@@ -470,6 +519,15 @@ impl Recording {
             finished_at: finished_at.to_rfc3339_opts(SecondsFormat::Secs, false),
             duration_sec: seconds(self.duration()),
             channels: BTreeMap::from([("0", "me"), ("1", "them")]),
+            participants: MetadataParticipants {
+                me: MetadataMe {
+                    name: &participants.me,
+                },
+                them: MetadataThem {
+                    num_speakers: participants.them.len(),
+                    names: &participants.them,
+                },
+            },
             files: self
                 .files
                 .iter()
@@ -948,7 +1006,8 @@ mod tests {
         }
         assert_eq!(rec.duration(), Duration::from_secs(2));
 
-        let saved = rec.stop(at(5), "", false).unwrap();
+        let participants = Participants::parse(" Александр М. ", "Алексей Ф., ,Дмитрий К. ,");
+        let saved = rec.stop(at(5), "", &participants, false).unwrap();
         let flac = dir.path().join("2026-10-21_14-00.flac");
         let json = dir.path().join("2026-10-21_14-00.json");
         assert_eq!(saved.files, vec![flac.clone()]);
@@ -972,6 +1031,13 @@ mod tests {
         assert_eq!(
             meta["channels"],
             serde_json::json!({ "0": "me", "1": "them" })
+        );
+        assert_eq!(
+            meta["participants"],
+            serde_json::json!({
+                "me": { "name": "Александр М." },
+                "them": { "num_speakers": 2, "names": ["Алексей Ф.", "Дмитрий К."] },
+            })
         );
         assert_eq!(meta["files"], serde_json::json!(["2026-10-21_14-00.flac"]));
         assert_eq!(meta["pauses"], serde_json::json!([]));
@@ -1003,7 +1069,9 @@ mod tests {
         }
         // Saved while paused: the recording ends where the pause began.
         rec.pause(at(50));
-        let saved = rec.stop(at(55), "", false).unwrap();
+        let saved = rec
+            .stop(at(55), "", &Participants::default(), false)
+            .unwrap();
 
         assert_eq!(decode(&saved.files[0]), blocks(0..20));
         let meta = read_json(&saved.metadata);
@@ -1028,7 +1096,9 @@ mod tests {
         fs::write(dir.path().join("2026-10-21_14-00-2-part1.flac"), b"").unwrap();
         let rec = Recording::start(dir.path(), at(0), "").unwrap();
         assert_eq!(rec.path(), dir.path().join("2026-10-21_14-00-3.flac"));
-        let saved = rec.stop(at(1), "", false).unwrap();
+        let saved = rec
+            .stop(at(1), "", &Participants::default(), false)
+            .unwrap();
         assert_eq!(saved.files, vec![rec_path(dir.path(), "-3.flac")]);
         assert_eq!(saved.metadata, rec_path(dir.path(), "-3.json"));
     }
@@ -1072,7 +1142,9 @@ mod tests {
         assert_eq!(rec.path(), flac);
         assert_eq!(rec.path_for("Планёрка"), flac);
 
-        let saved = rec.stop(at(5), "Планёрка", false).unwrap();
+        let saved = rec
+            .stop(at(5), "Планёрка", &Participants::default(), false)
+            .unwrap();
         assert_eq!(saved.files, vec![flac]);
         assert_eq!(
             names(dir.path()),
@@ -1098,7 +1170,9 @@ mod tests {
             dir.path().join("Ретро_2026-10-21_14-00.flac")
         );
         // The time is the start of the recording, not the stop.
-        let saved = rec.stop(at(3600), " Ретро ", false).unwrap();
+        let saved = rec
+            .stop(at(3600), " Ретро ", &Participants::default(), false)
+            .unwrap();
 
         let part1 = dir.path().join("Ретро_2026-10-21_14-00-part1.flac");
         let part2 = dir.path().join("Ретро_2026-10-21_14-00-part2.flac");
@@ -1126,7 +1200,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut rec = Recording::start(dir.path(), at(0), "Ретро").unwrap();
         rec.write_block(&block(0)).unwrap();
-        let saved = rec.stop(at(5), "Ретро", true).unwrap();
+        let saved = rec
+            .stop(at(5), "Ретро", &Participants::default(), true)
+            .unwrap();
         assert_eq!(
             saved.files,
             vec![dir.path().join("Ретро_2026-10-21_14-00_прервано.flac")]
@@ -1136,7 +1212,9 @@ mod tests {
         assert_eq!(meta["title"], "Ретро");
 
         let rec = Recording::start(dir.path(), at(60), "").unwrap();
-        let saved = rec.stop(at(61), "", true).unwrap();
+        let saved = rec
+            .stop(at(61), "", &Participants::default(), true)
+            .unwrap();
         assert_eq!(
             saved.metadata,
             dir.path().join("2026-10-21_14-01_прервано.json")
@@ -1174,7 +1252,9 @@ mod tests {
         fs::write(dir.path().join("Ретро_2026-10-21_14-00.flac"), b"old").unwrap();
         let mut rec = Recording::start(dir.path(), at(0), "").unwrap();
         rec.write_block(&block(0)).unwrap();
-        let saved = rec.stop(at(5), "Ретро", false).unwrap();
+        let saved = rec
+            .stop(at(5), "Ретро", &Participants::default(), false)
+            .unwrap();
         assert_eq!(
             saved.files,
             vec![dir.path().join("Ретро_2026-10-21_14-00-2.flac")]
@@ -1209,7 +1289,9 @@ mod tests {
         // The block that hit the failure is not lost.
         assert_eq!(rec.duration(), Duration::from_millis(600));
 
-        let saved = rec.stop(at(10), "", false).unwrap();
+        let saved = rec
+            .stop(at(10), "", &Participants::default(), false)
+            .unwrap();
         let part2 = dir.path().join("2026-10-21_14-00-part2.flac");
         assert_eq!(saved.files, vec![part1, part2.clone()]);
         assert_eq!(decode(&part2), blocks(3..6));
@@ -1231,7 +1313,9 @@ mod tests {
         rec.write_block(&block(0)).unwrap();
         rec.kill_encoder();
 
-        let err = rec.stop(at(1), "", false).unwrap_err();
+        let err = rec
+            .stop(at(1), "", &Participants::default(), false)
+            .unwrap_err();
         assert!(matches!(err, WriterError::Encoder { .. }), "{err}");
         let part = dir.path().join("2026-10-21_14-00.flac.part");
         assert_eq!(find_unfinished(dir.path()).unwrap(), vec![part]);

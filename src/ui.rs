@@ -21,6 +21,7 @@ use crate::app::{
     format_duration,
 };
 use crate::mixer::{Channel, LEVEL_FLOOR_DB};
+use crate::writer::speaker_names;
 
 /// Lowest level the meter shows; quieter is an empty bar.
 pub const METER_MIN_DB: f64 = -60.0;
@@ -28,8 +29,11 @@ pub const METER_MIN_DB: f64 = -60.0;
 pub const METER_DECAY_DB_PER_SEC: f64 = 30.0;
 /// How long the peak mark stays before it falls (spec 5.5).
 pub const PEAK_HOLD: Duration = Duration::from_secs(1);
-/// Longest meeting title the field accepts, in characters.
+/// Longest meeting title (and the user's name) the field accepts, in
+/// characters.
 pub const MAX_TITLE_CHARS: usize = 80;
+/// Longest list of speakers the field accepts, in characters.
+pub const MAX_SPEAKERS_CHARS: usize = 200;
 /// The recording and pause marks on the buttons blink with this half-period.
 const BLINK: Duration = Duration::from_millis(500);
 /// From this terminal width on, the device panels stand side by side.
@@ -74,6 +78,10 @@ enum Dialog {
     Save,
     /// The title is empty: give one or save without it.
     Name,
+    /// Last step of saving: confirm the speakers or edit them.
+    Speakers,
+    /// The speakers as text, separated by commas.
+    SpeakersEdit,
     /// Delete the recording or go back to it?
     Delete,
 }
@@ -86,6 +94,10 @@ enum DialogButton {
     /// Close the dialog; the recording stays as it is.
     Back,
     Leave,
+    /// Edit the speakers.
+    Edit,
+    /// Done editing the speakers.
+    Done,
 }
 
 /// What a key did to the title text.
@@ -101,15 +113,20 @@ enum Edit {
 /// Elements the keyboard focus moves between, in Tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
+    /// Text fields: the meeting title, the user's name, the speakers.
     Title,
+    Me,
+    Them,
     Record,
     Save,
     Delete,
     Quit,
 }
 
-const FOCUS_ORDER: [Focus; 5] = [
+const FOCUS_ORDER: [Focus; 7] = [
     Focus::Title,
+    Focus::Me,
+    Focus::Them,
     Focus::Record,
     Focus::Save,
     Focus::Delete,
@@ -196,9 +213,11 @@ pub struct Ui {
     enter_on_release: bool,
     /// Where Enter was pressed, while waiting for its release.
     enter_pressed: Option<(Option<Dialog>, Focus)>,
-    /// Meeting title as typed.
+    /// Meeting title, the user's name and the speakers, as typed.
     title: String,
-    /// Caret position in `title`, in characters.
+    my_name: String,
+    speakers: String,
+    /// Caret position in the text being edited, in characters.
     caret: usize,
     now: Instant,
     /// Start of the current pause, for the timer on the pause button.
@@ -219,6 +238,8 @@ impl Ui {
             enter_on_release: false,
             enter_pressed: None,
             title: String::new(),
+            my_name: app::DEFAULT_MY_NAME.to_owned(),
+            speakers: String::new(),
             caret: 0,
             now,
             paused_since: None,
@@ -293,15 +314,15 @@ impl Ui {
         if let Some(dialog) = self.dialog {
             return self.dialog_key(dialog, key);
         }
-        if self.focus == Focus::Title {
-            return self.title_key(key);
+        if is_field(self.focus) {
+            return self.field_key(key);
         }
         match key.code {
             KeyCode::Tab => self.cycle_focus(true),
             KeyCode::BackTab => self.cycle_focus(false),
             KeyCode::Right => self.move_between_buttons(true),
             KeyCode::Left => self.move_between_buttons(false),
-            KeyCode::Up => self.focus_title(),
+            KeyCode::Up => self.focus_field(Focus::Title),
             KeyCode::Enter => return self.activate(self.focus),
             // The same keys on the Russian layout.
             KeyCode::Char(c) => match c.to_lowercase().next().unwrap_or(c) {
@@ -309,7 +330,9 @@ impl Ui {
                 's' | 'ы' => return self.activate(Focus::Save),
                 'd' | 'в' => return self.activate(Focus::Delete),
                 'q' | 'й' => return self.activate(Focus::Quit),
-                'r' | 'к' => self.focus_title(),
+                'r' | 'к' => self.focus_field(Focus::Title),
+                'm' | 'ь' => self.focus_field(Focus::Me),
+                'c' | 'с' => self.focus_field(Focus::Them),
                 _ => {}
             },
             _ => {}
@@ -328,8 +351,8 @@ impl Ui {
             .find(|(area, _)| area.contains(position))
             .map(|(_, target)| *target)?;
         match target {
-            Target::Focus(Focus::Title) => {
-                self.focus_title();
+            Target::Focus(focus) if is_field(focus) => {
+                self.focus_field(focus);
                 None
             }
             Target::Focus(focus) => {
@@ -341,8 +364,8 @@ impl Ui {
     }
 
     /// Keys while a dialog is open: arrows and Tab move the selection, Enter
-    /// presses it, `Esc` is "Back", letters are shortcuts. In the name
-    /// prompt letters are text.
+    /// presses it, `Esc` is "Back", letters are shortcuts. In dialogs with a
+    /// text field letters are text.
     fn dialog_key(&mut self, dialog: Dialog, key: KeyEvent) -> Option<UiAction> {
         let buttons = dialog_buttons(dialog);
         match key.code {
@@ -353,9 +376,9 @@ impl Ui {
             }
             _ => {}
         }
-        if dialog == Dialog::Name {
-            return match self.edit_title(key) {
-                Edit::Changed => Some(self.title_changed()),
+        if let Some(field) = dialog_field(dialog) {
+            return match self.edit(field, key) {
+                Edit::Changed => Some(self.field_changed(field)),
                 Edit::Moved | Edit::Ignored => None,
             };
         }
@@ -388,13 +411,26 @@ impl Ui {
         let dialog = self.dialog?;
         self.dialog = None;
         match (dialog, button) {
-            (_, DialogButton::Back) => None,
+            // Editing the speakers goes back to their confirmation.
+            (Dialog::SpeakersEdit, DialogButton::Back | DialogButton::Done) => {
+                self.open(Dialog::Speakers);
+                None
+            }
+            (_, DialogButton::Back | DialogButton::Done) => None,
             (_, DialogButton::Leave) => Some(UiAction::Quit(QuitReason::User)),
             (Dialog::Save, DialogButton::Save) if self.title.trim().is_empty() => {
                 self.open(Dialog::Name);
                 None
             }
+            (Dialog::Save | Dialog::Name, DialogButton::Save) => {
+                self.open(Dialog::Speakers);
+                None
+            }
             (_, DialogButton::Save) => Some(UiAction::Command(Command::Save)),
+            (_, DialogButton::Edit) => {
+                self.open(Dialog::SpeakersEdit);
+                None
+            }
             (Dialog::Save, DialogButton::Delete) => {
                 self.open(Dialog::Delete);
                 None
@@ -403,29 +439,30 @@ impl Ui {
         }
     }
 
-    /// Opens a dialog with its default button selected: "Save" in the save
-    /// dialog and the name prompt, "Back" in the others. The name prompt puts
-    /// the caret after the title.
+    /// Opens a dialog with its default button selected: "Save" ("Done") in
+    /// the dialogs of saving, "Back" in the others. A text field gets the
+    /// caret at its end.
     fn open(&mut self, dialog: Dialog) {
         let default = match dialog {
-            Dialog::Save | Dialog::Name => DialogButton::Save,
+            Dialog::Save | Dialog::Name | Dialog::Speakers => DialogButton::Save,
+            Dialog::SpeakersEdit => DialogButton::Done,
             Dialog::Quit | Dialog::Delete => DialogButton::Back,
         };
         self.selected = dialog_buttons(dialog)
             .iter()
             .position(|&(_, button, _)| button == default)
             .unwrap_or(0);
-        if dialog == Dialog::Name {
-            self.caret = self.title.chars().count();
+        if let Some(field) = dialog_field(dialog) {
+            self.caret = self.text(field).chars().count();
         }
         self.dialog = Some(dialog);
     }
 
-    /// Keys while the title field has the focus: typing edits the title, so
-    /// the shortcuts are off until the focus leaves the field.
-    fn title_key(&mut self, key: KeyEvent) -> Option<UiAction> {
-        match self.edit_title(key) {
-            Edit::Changed => return Some(self.title_changed()),
+    /// Keys while a text field has the focus: typing edits it, so the
+    /// shortcuts are off until the focus leaves the field.
+    fn field_key(&mut self, key: KeyEvent) -> Option<UiAction> {
+        match self.edit(self.focus, key) {
+            Edit::Changed => return Some(self.field_changed(self.focus)),
             Edit::Moved => return None,
             Edit::Ignored => {}
         }
@@ -438,69 +475,86 @@ impl Ui {
         None
     }
 
-    /// Typing, deleting and moving the caret in the title.
-    fn edit_title(&mut self, key: KeyEvent) -> Edit {
-        let len = self.title.chars().count();
+    /// Typing, deleting and moving the caret in a text field.
+    fn edit(&mut self, field: Focus, key: KeyEvent) -> Edit {
+        let (text, max) = match field {
+            Focus::Me => (&mut self.my_name, MAX_TITLE_CHARS),
+            Focus::Them => (&mut self.speakers, MAX_SPEAKERS_CHARS),
+            _ => (&mut self.title, MAX_TITLE_CHARS),
+        };
+        let caret = &mut self.caret;
+        let len = text.chars().count();
         match key.code {
             KeyCode::Char(c)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if c.is_control() || len >= MAX_TITLE_CHARS {
+                if c.is_control() || len >= max {
                     return Edit::Moved;
                 }
-                let at = byte_index(&self.title, self.caret);
-                self.title.insert(at, c);
-                self.caret += 1;
+                text.insert(byte_index(text, *caret), c);
+                *caret += 1;
                 Edit::Changed
             }
             KeyCode::Backspace => {
-                if self.caret == 0 {
+                if *caret == 0 {
                     return Edit::Moved;
                 }
-                self.caret -= 1;
-                let at = byte_index(&self.title, self.caret);
-                self.title.remove(at);
+                *caret -= 1;
+                text.remove(byte_index(text, *caret));
                 Edit::Changed
             }
             KeyCode::Delete => {
-                if self.caret >= len {
+                if *caret >= len {
                     return Edit::Moved;
                 }
-                let at = byte_index(&self.title, self.caret);
-                self.title.remove(at);
+                text.remove(byte_index(text, *caret));
                 Edit::Changed
             }
             KeyCode::Left => {
-                self.caret = self.caret.saturating_sub(1);
+                *caret = caret.saturating_sub(1);
                 Edit::Moved
             }
             KeyCode::Right => {
-                self.caret = (self.caret + 1).min(len);
+                *caret = (*caret + 1).min(len);
                 Edit::Moved
             }
             KeyCode::Home => {
-                self.caret = 0;
+                *caret = 0;
                 Edit::Moved
             }
             KeyCode::End => {
-                self.caret = len;
+                *caret = len;
                 Edit::Moved
             }
             _ => Edit::Ignored,
         }
     }
 
-    fn title_changed(&self) -> UiAction {
-        UiAction::Command(Command::SetTitle(self.title.clone()))
+    /// Text of a field: the title, the user's name or the speakers.
+    fn text(&self, field: Focus) -> &str {
+        match field {
+            Focus::Me => &self.my_name,
+            Focus::Them => &self.speakers,
+            _ => &self.title,
+        }
     }
 
-    fn focus_title(&mut self) {
-        if self.focus != Focus::Title {
-            self.caret = self.title.chars().count();
+    fn field_changed(&self, field: Focus) -> UiAction {
+        let text = self.text(field).to_owned();
+        UiAction::Command(match field {
+            Focus::Me => Command::SetMyName(text),
+            Focus::Them => Command::SetSpeakers(text),
+            _ => Command::SetTitle(text),
+        })
+    }
+
+    fn focus_field(&mut self, field: Focus) {
+        if self.focus != field {
+            self.caret = self.text(field).chars().count();
         }
-        self.focus = Focus::Title;
+        self.focus = field;
     }
 
     /// Elements that exist now: "Save" and "Delete" only with a recording.
@@ -511,7 +565,7 @@ impl Ui {
     fn cycle_focus(&mut self, forward: bool) {
         let order: Vec<Focus> = FOCUS_ORDER.into_iter().filter(|&f| self.shown(f)).collect();
         match cycle(&order, self.focus, forward) {
-            Focus::Title => self.focus_title(),
+            focus if is_field(focus) => self.focus_field(focus),
             focus => self.focus = focus,
         }
     }
@@ -540,8 +594,8 @@ impl Ui {
         let state = self.snapshot.state;
         let recording = is_recording(state);
         let command = match focus {
-            Focus::Title => {
-                self.focus_title();
+            Focus::Title | Focus::Me | Focus::Them => {
+                self.focus_field(focus);
                 return None;
             }
             Focus::Record => record_command(state),
@@ -564,8 +618,8 @@ impl Ui {
     }
 
     /// Full-screen layout: device panels on top (side by side when wide
-    /// enough), the title field and status, the log in the remaining space,
-    /// buttons at the bottom.
+    /// enough), the title field and status, the name fields, the log in the
+    /// remaining space, buttons at the bottom.
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         self.targets.clear();
         let side_by_side = frame.area().width >= SIDE_BY_SIDE_MIN_WIDTH;
@@ -574,8 +628,9 @@ impl Ui {
         } else {
             DEVICE_PANEL_HEIGHT * 2
         };
-        let [devices, status_row, log, buttons] = Layout::vertical([
+        let [devices, status_row, names_row, log, buttons] = Layout::vertical([
             Constraint::Length(devices_height),
+            Constraint::Length(STATUS_HEIGHT),
             Constraint::Length(STATUS_HEIGHT),
             Constraint::Fill(1),
             Constraint::Length(BUTTONS_HEIGHT),
@@ -587,6 +642,8 @@ impl Ui {
             Layout::vertical([Constraint::Length(DEVICE_PANEL_HEIGHT); 2]).areas(devices)
         };
         let [title_area, status] = Layout::horizontal([Constraint::Fill(1); 2]).areas(status_row);
+        let [me_area, them_names_area] =
+            Layout::horizontal([Constraint::Fill(1); 2]).areas(names_row);
 
         let snapshot = &self.snapshot;
         render_channel(frame, mic_area, Channel::Mic, &snapshot.mic, &self.mic);
@@ -607,19 +664,27 @@ impl Ui {
             .collect();
         frame.render_widget(Paragraph::new(lines).block(log_block), log);
 
-        self.draw_title(frame, title_area);
+        self.draw_field(frame, title_area, Focus::Title);
+        self.draw_field(frame, me_area, Focus::Me);
+        self.draw_field(frame, them_names_area, Focus::Them);
         self.draw_buttons(frame, buttons);
         if let Some(dialog) = self.dialog {
             self.draw_dialog(frame, dialog);
         }
     }
 
-    /// The meeting title field with the terminal cursor at the caret while it
-    /// has the focus.
-    fn draw_title(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let focused = self.focus == Focus::Title && self.dialog.is_none();
+    /// A text field with the terminal cursor at the caret while it has the
+    /// focus.
+    fn draw_field(&mut self, frame: &mut Frame<'_>, area: Rect, field: Focus) {
+        let focused = self.focus == field && self.dialog.is_none();
+        let (label, placeholder) = match field {
+            Focus::Me => (" Я [m] ", " не указано"),
+            Focus::Them => (" Собеседники [c] ", " имена через запятую"),
+            _ => (" Название встречи [r] ", " без названия"),
+        };
+        let text = self.text(field);
         let block = Block::bordered()
-            .title(" Название встречи [r] ")
+            .title(label)
             .border_type(if focused {
                 BorderType::Thick
             } else {
@@ -630,14 +695,15 @@ impl Ui {
         // One cell of padding on the left, one for the caret after the text.
         let width = usize::from(inner.width).saturating_sub(2);
         let skip = self.caret.saturating_sub(width);
-        let line = if self.title.is_empty() && !focused {
-            Line::styled(" без названия", Style::default().fg(Color::DarkGray))
+        let skip = if focused { skip } else { 0 };
+        let line = if text.is_empty() && !focused {
+            Line::styled(placeholder, Style::default().fg(Color::DarkGray))
         } else {
-            let visible: String = self.title.chars().skip(skip).take(width).collect();
+            let visible: String = text.chars().skip(skip).take(width).collect();
             Line::from(format!(" {visible}"))
         };
         frame.render_widget(Paragraph::new(line).block(block), area);
-        self.targets.push((area, Target::Focus(Focus::Title)));
+        self.targets.push((area, Target::Focus(field)));
 
         if focused && inner.height > 0 {
             let offset = u16::try_from(self.caret - skip).unwrap_or(u16::MAX);
@@ -715,7 +781,9 @@ impl Ui {
                 Focus::Record => ("пробел", record.clone(), record_accent),
                 Focus::Save => ("s", Line::from("✔ Сохранить"), None),
                 Focus::Delete => ("d", Line::from("⌫ Удалить запись"), None),
-                Focus::Title | Focus::Quit => ("q", Line::from("✕ Выход"), None),
+                Focus::Title | Focus::Me | Focus::Them | Focus::Quit => {
+                    ("q", Line::from("✕ Выход"), None)
+                }
             };
             self.draw_button(frame, button_area, focus, key, label, accent);
         }
@@ -735,7 +803,7 @@ impl Ui {
         let enabled = match focus {
             Focus::Record => app::allows(self.snapshot.state, &record_command(self.snapshot.state)),
             Focus::Save | Focus::Delete => is_recording(self.snapshot.state),
-            Focus::Title | Focus::Quit => true,
+            Focus::Title | Focus::Me | Focus::Them | Focus::Quit => true,
         };
         let focused = self.focus == focus && self.dialog.is_none();
         let dim = Style::default()
@@ -780,8 +848,9 @@ impl Ui {
 
     /// The open dialog over the screen. Only its buttons are clickable.
     fn draw_dialog(&mut self, frame: &mut Frame<'_>, dialog: Dialog) {
-        let DialogContent { title, color, text } = dialog_content(dialog);
-        let name_field = dialog == Dialog::Name;
+        let DialogContent { title, color, text } = self.dialog_content(dialog);
+        let field = dialog_field(dialog);
+        let name_field = field.is_some();
 
         let buttons_width: usize = dialog_buttons(dialog)
             .iter()
@@ -814,8 +883,13 @@ impl Ui {
         let field_row = lines.len();
         let field_width = usize::from(inner.width).saturating_sub(2);
         let skip = self.caret.saturating_sub(field_width.saturating_sub(1));
-        if name_field {
-            let visible: String = self.title.chars().skip(skip).take(field_width).collect();
+        if let Some(field) = field {
+            let visible: String = self
+                .text(field)
+                .chars()
+                .skip(skip)
+                .take(field_width)
+                .collect();
             let padding = field_width.saturating_sub(visible.chars().count());
             lines.push(Line::from(vec![
                 Span::raw(" "),
@@ -866,44 +940,92 @@ impl Ui {
             }
         }
     }
+
+    fn dialog_content(&self, dialog: Dialog) -> DialogContent {
+        let lines = |text: &[&str]| text.iter().map(|&line| line.to_owned()).collect();
+        match dialog {
+            Dialog::Quit => DialogContent {
+                title: " Выход ",
+                color: Color::Yellow,
+                text: lines(&[
+                    "Запись не сохранена. Выйти?",
+                    "Она сохранится с пометкой «прервано».",
+                ]),
+            },
+            Dialog::Save => DialogContent {
+                title: " Сохранение ",
+                color: Color::Yellow,
+                text: lines(&["Запись на паузе. Сохранить её?"]),
+            },
+            Dialog::Name => DialogContent {
+                title: " Название встречи ",
+                color: Color::Cyan,
+                text: lines(&[
+                    "Название не задано. Введите его",
+                    "или оставьте поле пустым.",
+                ]),
+            },
+            Dialog::Speakers => {
+                let names = speaker_names(&self.speakers);
+                let me = self.my_name.trim();
+                DialogContent {
+                    title: " Собеседники ",
+                    color: Color::Cyan,
+                    // One name per line: a long list on one line would be
+                    // cut off at the screen edge.
+                    text: [
+                        format!(
+                            "Я: {}",
+                            if me.is_empty() {
+                                "не указано"
+                            } else {
+                                me
+                            }
+                        ),
+                        format!("Собеседников: {}", names.len()),
+                    ]
+                    .into_iter()
+                    .chain(if names.is_empty() {
+                        vec!["Имена не указаны.".to_owned()]
+                    } else {
+                        names.iter().map(|name| format!("  {name}")).collect()
+                    })
+                    .collect(),
+                }
+            }
+            Dialog::SpeakersEdit => DialogContent {
+                title: " Собеседники ",
+                color: Color::Cyan,
+                text: lines(&["Имена собеседников через запятую:"]),
+            },
+            Dialog::Delete => DialogContent {
+                title: " Удаление ",
+                color: Color::Red,
+                text: lines(&["Удалить запись? Это нельзя отменить."]),
+            },
+        }
+    }
 }
 
 /// Title, border color and text of a dialog.
 struct DialogContent {
     title: &'static str,
     color: Color,
-    text: Vec<&'static str>,
+    text: Vec<String>,
 }
 
-fn dialog_content(dialog: Dialog) -> DialogContent {
+/// The text field of a dialog, if it has one.
+fn dialog_field(dialog: Dialog) -> Option<Focus> {
     match dialog {
-        Dialog::Quit => DialogContent {
-            title: " Выход ",
-            color: Color::Yellow,
-            text: vec![
-                "Запись не сохранена. Выйти?",
-                "Она сохранится с пометкой «прервано».",
-            ],
-        },
-        Dialog::Save => DialogContent {
-            title: " Сохранение ",
-            color: Color::Yellow,
-            text: vec!["Запись на паузе. Сохранить её?"],
-        },
-        Dialog::Name => DialogContent {
-            title: " Название встречи ",
-            color: Color::Cyan,
-            text: vec![
-                "Название не задано. Введите его",
-                "или оставьте поле пустым.",
-            ],
-        },
-        Dialog::Delete => DialogContent {
-            title: " Удаление ",
-            color: Color::Red,
-            text: vec!["Удалить запись? Это нельзя отменить."],
-        },
+        Dialog::Name => Some(Focus::Title),
+        Dialog::SpeakersEdit => Some(Focus::Them),
+        Dialog::Quit | Dialog::Save | Dialog::Speakers | Dialog::Delete => None,
     }
+}
+
+/// Whether the element is a text field.
+fn is_field(focus: Focus) -> bool {
+    matches!(focus, Focus::Title | Focus::Me | Focus::Them)
 }
 
 /// Buttons of a dialog, left to right: label, button, shortcut letters.
@@ -921,6 +1043,15 @@ fn dialog_buttons(dialog: Dialog) -> &'static [(&'static str, DialogButton, &'st
         ],
         Dialog::Name => &[
             ("[Enter] Сохранить", DialogButton::Save, ""),
+            ("[Esc] Назад", DialogButton::Back, ""),
+        ],
+        Dialog::Speakers => &[
+            ("[Enter] Подтвердить", DialogButton::Save, ""),
+            ("[e] Редактировать", DialogButton::Edit, "eу"),
+            ("[Esc] Назад", DialogButton::Back, ""),
+        ],
+        Dialog::SpeakersEdit => &[
+            ("[Enter] Готово", DialogButton::Done, ""),
             ("[Esc] Назад", DialogButton::Back, ""),
         ],
         Dialog::Delete => &[
@@ -1375,10 +1506,11 @@ mod tests {
 
         let terminal = render_sized(&mut ui, 80, 40);
         let screen = lines(&terminal).join("\n");
-        // 40 rows: 10 for devices, 3 status, 3 buttons, 2 log borders.
+        // 40 rows: 10 for devices, 3 status, 3 names, 3 buttons, 2 log
+        // borders.
         assert!(screen.contains("событие 40"));
-        assert!(screen.contains("событие 19"));
-        assert!(!screen.contains("событие 18 "), "{screen}");
+        assert!(screen.contains("событие 22"));
+        assert!(!screen.contains("событие 21 "), "{screen}");
         let (_, last) = find(&terminal, "событие 40");
         assert_eq!(last, 40 - BUTTONS_HEIGHT - 2);
     }
@@ -1534,22 +1666,105 @@ mod tests {
     }
 
     #[test]
-    fn titled_recording_is_saved_at_once() {
+    fn titled_recording_goes_to_speakers() {
         let mut ui = Ui::new(snapshot(State::Recording), Instant::now());
         ui.key(key('r'));
         ui.key(key('Р'));
         ui.key(code(KeyCode::Enter));
         ui.key(key('s'));
         // "Save" is preselected.
-        assert_eq!(ui.key(code(KeyCode::Enter)), command(Command::Save));
+        assert_eq!(ui.key(code(KeyCode::Enter)), None);
         assert!(!screen_has(&mut ui, "Сохранить её?"));
+        assert!(screen_has(&mut ui, "Собеседников: 0"));
+        // "Confirm" is preselected.
+        assert_eq!(ui.key(code(KeyCode::Enter)), command(Command::Save));
 
         let mut ui = Ui::new(snapshot(State::Paused), Instant::now());
         ui.key(key('r'));
         ui.key(key('Р'));
         ui.key(code(KeyCode::Enter));
         ui.key(key('s'));
-        assert_eq!(ui.key(key('s')), command(Command::Save));
+        assert_eq!(ui.key(key('s')), None);
+        assert_eq!(ui.key(code(KeyCode::Enter)), command(Command::Save));
+    }
+
+    #[test]
+    fn long_speaker_list_is_shown_in_full() {
+        let names = [
+            "Константин Константинопольский",
+            "Александра Преображенская",
+            "Владислав Ворошиловградский",
+            "Евгения Семипалатинская",
+        ];
+        let mut ui = Ui::new(snapshot(State::Paused), Instant::now());
+        ui.key(key('c'));
+        for c in names.join(", ").chars() {
+            ui.key(key(c));
+        }
+        ui.key(code(KeyCode::Enter));
+        ui.key(key('r'));
+        ui.key(key('Р'));
+        ui.key(code(KeyCode::Enter));
+        ui.key(key('s'));
+        ui.key(key('s'));
+        let screen = screen(&mut ui);
+        assert!(screen.contains("Собеседников: 4"), "{screen}");
+        for name in names {
+            assert!(screen.contains(name), "{name:?} missing in:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn speakers_are_confirmed_and_edited_before_saving() {
+        let mut ui = Ui::new(snapshot(State::Recording), Instant::now());
+        ui.key(key('c'));
+        for c in "Алексей Ф., Дмитрий К.".chars() {
+            ui.key(key(c));
+        }
+        ui.key(code(KeyCode::Enter));
+        ui.key(key('r'));
+        ui.key(key('Р'));
+        ui.key(code(KeyCode::Enter));
+        ui.key(key('s'));
+        ui.key(key('s'));
+        let screen = screen(&mut ui);
+        for text in [
+            "Я: Александр М.",
+            "Собеседников: 2",
+            "  Алексей Ф.",
+            "  Дмитрий К.",
+            "[Enter] Подтвердить   [e] Редактировать   [Esc] Назад",
+        ] {
+            assert!(screen.contains(text), "{text:?} missing in:\n{screen}");
+        }
+
+        // Editing: plain text, letters are text; Enter goes back to the
+        // confirmation with the new count.
+        assert_eq!(ui.key(key('у')), None);
+        assert!(screen_has(&mut ui, "Имена собеседников через запятую:"));
+        assert_eq!(
+            ui.key(key(',')),
+            command(Command::SetSpeakers("Алексей Ф., Дмитрий К.,".into()))
+        );
+        assert_eq!(
+            ui.key(key('e')),
+            command(Command::SetSpeakers("Алексей Ф., Дмитрий К.,e".into()))
+        );
+        assert_eq!(ui.key(code(KeyCode::Enter)), None);
+        assert!(screen_has(&mut ui, "Собеседников: 3"));
+        // Esc in the editor also goes back to the confirmation.
+        ui.key(key('e'));
+        assert_eq!(ui.key(code(KeyCode::Esc)), None);
+        assert!(screen_has(&mut ui, "Собеседников: 3"));
+        assert_eq!(ui.key(code(KeyCode::Enter)), command(Command::Save));
+
+        // "Back" in the confirmation closes it; the recording stays paused.
+        let mut ui = Ui::new(snapshot(State::Paused), Instant::now());
+        ui.key(key('s'));
+        ui.key(key('s'));
+        ui.key(code(KeyCode::Enter));
+        assert_eq!(ui.key(code(KeyCode::Esc)), None);
+        assert!(!screen_has(&mut ui, "Собеседников"));
     }
 
     #[test]
@@ -1568,6 +1783,7 @@ mod tests {
             // The field is three rows below the first line of text.
             Position::new(x + 2, y + 3)
         );
+        assert_eq!(ui.key(code(KeyCode::Enter)), None);
         assert_eq!(ui.key(code(KeyCode::Enter)), command(Command::Save));
     }
 
@@ -1575,6 +1791,7 @@ mod tests {
     fn name_can_stay_empty() {
         let mut ui = Ui::new(snapshot(State::Recording), Instant::now());
         ui.key(key('s'));
+        ui.key(code(KeyCode::Enter));
         ui.key(code(KeyCode::Enter));
         assert_eq!(ui.key(code(KeyCode::Enter)), command(Command::Save));
 
@@ -1729,10 +1946,18 @@ mod tests {
         // Now in the title field: letters are text, not shortcuts.
         assert_eq!(ui.key(key('p')), set_title("p"));
         assert_eq!(ui.key(key(' ')), set_title("p "));
+        // Then the user's name and the speakers.
+        ui.key(code(KeyCode::Tab));
+        assert_eq!(
+            ui.key(key('!')),
+            command(Command::SetMyName(format!("{}!", app::DEFAULT_MY_NAME)))
+        );
+        ui.key(code(KeyCode::Tab));
+        assert_eq!(ui.key(key('s')), command(Command::SetSpeakers("s".into())));
         ui.key(code(KeyCode::Tab));
         assert_eq!(ui.key(code(KeyCode::Enter)), command(Command::TogglePause));
         ui.key(code(KeyCode::BackTab));
-        assert_eq!(ui.key(key('q')), set_title("p q"));
+        assert_eq!(ui.key(key('q')), command(Command::SetSpeakers("sq".into())));
 
         // Idle: from the record button straight to quit.
         let mut ui = Ui::new(snapshot(State::Idle), Instant::now());

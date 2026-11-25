@@ -14,10 +14,12 @@ use crossbeam_channel::{Receiver, Sender, select};
 
 use crate::mixer::{Block, Channel, ChannelTick, Mixer, SAMPLE_RATE, TICK, TickClock};
 use crate::pw::{Device, PcmChunk, PwEvent};
-use crate::writer::{self, Recording, Saved, WriteOutcome, WriterError};
+use crate::writer::{self, Participants, Recording, Saved, WriteOutcome, WriterError};
 
 /// Number of events kept in the log; the UI shows as many as fit (spec 3).
 pub const LOG_CAPACITY: usize = 100;
+/// The user's name until it is edited (spec 3).
+pub const DEFAULT_MY_NAME: &str = "Александр М.";
 /// A channel quieter than this while recording counts as silent (spec 6.3).
 pub const SILENCE_THRESHOLD_DB: f64 = -60.0;
 /// How long a channel must stay silent before it is highlighted (spec 6.3).
@@ -53,6 +55,10 @@ pub enum Command {
     /// The meeting title was edited. It names the files when the recording
     /// is saved, so it can be changed at any time (spec 3, 5.7).
     SetTitle(String),
+    /// The user's own name was edited; saved in the metadata (spec 5.7).
+    SetMyName(String),
+    /// The speakers were edited: names separated by commas (spec 5.7).
+    SetSpeakers(String),
 }
 
 /// Why the app exits; shown in the event log.
@@ -150,6 +156,7 @@ pub trait Recorder {
         self,
         at: DateTime<Local>,
         title: &str,
+        participants: &Participants,
         interrupted: bool,
     ) -> Result<Saved, WriterError>;
     /// Stops and deletes all files of the recording.
@@ -210,9 +217,10 @@ impl Recorder for Recording {
         self,
         at: DateTime<Local>,
         title: &str,
+        participants: &Participants,
         interrupted: bool,
     ) -> Result<Saved, WriterError> {
-        Recording::stop(self, at, title, interrupted)
+        Recording::stop(self, at, title, participants, interrupted)
     }
 
     fn discard(self) -> Result<(), WriterError> {
@@ -377,6 +385,9 @@ pub struct App<S: Storage> {
     recorder: Option<S::Recorder>,
     /// Meeting title for the file name; empty for none.
     title: String,
+    /// The user's name and the speakers, as typed.
+    my_name: String,
+    speakers: String,
     /// The app quit without the user saving the recording.
     interrupted: bool,
     /// The recording in `Saving` is deleted instead of saved.
@@ -398,6 +409,8 @@ impl<S: Storage> App<S> {
             state: State::Idle,
             recorder: None,
             title: String::new(),
+            my_name: DEFAULT_MY_NAME.to_owned(),
+            speakers: String::new(),
             interrupted: false,
             discarding: false,
             last_path: None,
@@ -455,6 +468,8 @@ impl<S: Storage> App<S> {
                 }
             }
             Command::SetTitle(title) => self.title = title,
+            Command::SetMyName(name) => self.my_name = name,
+            Command::SetSpeakers(names) => self.speakers = names,
         }
     }
 
@@ -549,7 +564,8 @@ impl<S: Storage> App<S> {
         }
         self.last_duration = recorder.duration();
         self.last_path = Some(recorder.path_for(&self.title));
-        match recorder.stop(now, &self.title, interrupted) {
+        let participants = Participants::parse(&self.my_name, &self.speakers);
+        match recorder.stop(now, &self.title, &participants, interrupted) {
             Ok(saved) => {
                 if let Some(first) = saved.files.first() {
                     self.last_path = Some(first.clone());
@@ -769,7 +785,10 @@ pub fn allows(state: State, command: &Command) -> bool {
         Command::TogglePause | Command::Pause | Command::Save | Command::Discard => {
             matches!(state, State::Recording | State::Paused)
         }
-        Command::Quit(_) | Command::SetTitle(_) => true,
+        Command::Quit(_)
+        | Command::SetTitle(_)
+        | Command::SetMyName(_)
+        | Command::SetSpeakers(_) => true,
     }
 }
 
@@ -905,6 +924,8 @@ mod tests {
     #[allow(clippy::struct_excessive_bools)]
     struct Fake {
         calls: Vec<Call>,
+        /// Participants of the last stop.
+        participants: Option<Participants>,
         space: Option<bool>,
         fail_start: bool,
         fail_write: bool,
@@ -985,10 +1006,12 @@ mod tests {
             self,
             _at: DateTime<Local>,
             title: &str,
+            participants: &Participants,
             interrupted: bool,
         ) -> Result<Saved, WriterError> {
             let mut fake = self.0.borrow_mut();
             fake.calls.push(Call::Stop(title.to_owned(), interrupted));
+            fake.participants = Some(participants.clone());
             if fake.fail_stop {
                 return Err(io_error());
             }
@@ -1164,6 +1187,32 @@ mod tests {
         // The next recording starts with the title as it is now.
         app.command(Command::Start, at(4));
         assert_eq!(calls(&fake), vec![Call::Start("Ретро".into())]);
+    }
+
+    #[test]
+    fn participants_are_saved_as_edited() {
+        let (mut app, fake) = app();
+        app.command(Command::Start, at(0));
+        app.command(Command::Save, at(1));
+        app.finish_saving(at(1));
+        assert_eq!(
+            fake.borrow().participants,
+            Some(Participants::parse(DEFAULT_MY_NAME, ""))
+        );
+
+        assert!(app.allows(&Command::SetSpeakers(String::new())));
+        app.command(Command::Start, at(2));
+        app.command(Command::SetMyName("Я".into()), at(3));
+        app.command(Command::SetSpeakers("Алексей Ф., Дмитрий К.".into()), at(3));
+        app.command(Command::Quit(QuitReason::CtrlC), at(4));
+        app.finish_saving(at(4));
+        assert_eq!(
+            fake.borrow().participants,
+            Some(Participants {
+                me: "Я".into(),
+                them: vec!["Алексей Ф.".into(), "Дмитрий К.".into()],
+            })
+        );
     }
 
     #[test]
